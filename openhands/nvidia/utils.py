@@ -385,7 +385,7 @@ def process_messages_from_agent_state(
                     [new_message],
                     tokenizer,
                     chat_template=chat_template,
-                    add_generation_prompt=False,
+                    add_generation_prompt=True,
                     enable_thinking=enable_thinking,
                     tools=tools,
                 )[0]
