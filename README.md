@@ -237,3 +237,16 @@ More module READMEs (click to open):
 To validate the functionality of the ProRLAgent servers, we conducted experiments on software engineering (SWE) tasks by integrating the server with our ProRLAgent Training framework based on verl. We did some initial RL training on Qwen3-4B-Instruct-2507 model. We used 32 A100 GPUs to train the model. Our training data is a subset of [SWE-GYM](https://huggingface.co/datasets/NovaSky-AI/SkyRL-v0-293-data) with 293 training examples. Training for around 66 steps have allowed the Pass@1 on SWE-Bench-Verified to be improved from 14.8% to 21.2%，the following charts shows the test results on SWE-Bench-Verified. It increases during training.
 <img src="NVIDIA_Assets/swe-bench.png" alt="swe-bench curve" width="600" />
 
+
+## 📖 Reference
+> [!IMPORTANT]
+> If you find it useful, please consider citing our work:
+
+```md
+@article{zhang2026prorl,
+  title={ProRL Agent: Rollout-as-a-Service for RL Training of Multi-Turn LLM Agents},
+  author={Zhang, Hao and Liu, Mingjie and Zhang, Shaokun and Han, Songyang and Hu, Jian and Jin, Zhenghui and Zhang, Yuchi and Diao, Shizhe and Lu, Ximing and Xu, Binfeng and others},
+  journal={arXiv preprint arXiv:2603.18815},
+  year={2026}
+}
+```
