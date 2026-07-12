@@ -254,12 +254,14 @@ polar_min_complete_accept_fraction="${polar_min_complete_accept_fraction:-0.6}"
 polar_multi_gateway="${polar_multi_gateway:-0}"
 polar_gateway_count="${polar_gateway_count:-1}"
 polar_gateway_hosts="${polar_gateway_hosts:-}"
+polar_gateway_ranks="${polar_gateway_ranks:-}"
 polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
 polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-192}"
 polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-96}"
 polar_runtime_memory_mb="${polar_runtime_memory_mb:-}"
 polar_task_timeout_seconds="${polar_task_timeout_seconds:-1200}"
 polar_request_timeout="${polar_request_timeout:-1200}"
+log_probs_chunk_size="${log_probs_chunk_size:-256}"
 pi_api_type="${pi_api_type:-openai-completions}"
 pi_max_tokens="${pi_max_tokens:-512}"
 pi_thinking="${pi_thinking:-}"
@@ -955,6 +957,7 @@ render_runtime_configs() {
     export POLAR_MULTI_GATEWAY="${polar_multi_gateway}"
     export POLAR_GATEWAY_COUNT="${polar_gateway_count}"
     export POLAR_GATEWAY_HOSTS="${polar_gateway_hosts}"
+    export POLAR_GATEWAY_RANKS="${polar_gateway_ranks}"
     export POLAR_GATEWAY_MAX_INIT_WORKERS="${polar_gateway_max_init_workers}"
     export POLAR_GATEWAY_MAX_RUN_WORKERS="${polar_gateway_max_run_workers}"
     export POLAR_GATEWAY_MAX_POSTRUN_WORKERS="${polar_gateway_max_postrun_workers}"
@@ -970,6 +973,7 @@ render_runtime_configs() {
     export POLAR_BUILDER_STRATEGY="${polar_builder_strategy}"
     export POLAR_BIND_HOST="${polar_bind_host:-0.0.0.0}"
     export POLAR_PUBLIC_HOST="${polar_public_host:-${ray_head_ip}}"
+    export POLAR_GATEWAY_PRIMARY_HOST="${polar_gateway_hosts%%,*}"
 
     "${python_bin}" - "${script_dir}/topology.yaml" "${topology_path}" \
         "${script_dir}/polar_config.yaml" "${custom_config_path}" <<'PY'
@@ -1007,12 +1011,19 @@ inference["base_url"] = os.environ["SGLANG_ROUTER_BASE_URL"]
 if os.environ["POLAR_MULTI_GATEWAY"] == "1":
     hosts = [host.strip() for host in os.environ["POLAR_GATEWAY_HOSTS"].split(",") if host.strip()]
     expected = int(os.environ["POLAR_GATEWAY_COUNT"])
+    ranks = [rank.strip() for rank in os.environ.get("POLAR_GATEWAY_RANKS", "").split(",") if rank.strip()]
+    if not ranks:
+        ranks = [str(rank) for rank in range(expected)]
     if len(hosts) != expected:
         raise SystemExit(f"expected {expected} gateway hosts, got {len(hosts)}: {hosts}")
+    if len(ranks) != expected:
+        raise SystemExit(f"expected {expected} gateway ranks, got {len(ranks)}: {ranks}")
     if len(set(hosts)) != len(hosts):
         raise SystemExit(f"gateway hosts must be unique: {hosts}")
+    if len(set(ranks)) != len(ranks):
+        raise SystemExit(f"gateway ranks must be unique: {ranks}")
     nodes[:] = []
-    for rank, host in enumerate(hosts):
+    for rank, host in zip(ranks, hosts):
         node = deepcopy(prototype)
         node["id"] = f"slurm-rank-{rank}"
         node["public_url"] = f"http://{host}:{os.environ['GATEWAY_PORT']}"
@@ -1028,7 +1039,8 @@ with open(topology_out, "w", encoding="utf-8") as fh:
 with open(config_in, encoding="utf-8") as fh:
     config = yaml.safe_load(fh) or {}
 config["polar_rollout_url"] = f"http://{os.environ['POLAR_PUBLIC_HOST']}:{os.environ['ROLLOUT_PORT']}"
-config["polar_gateway_url"] = f"http://{os.environ['POLAR_PUBLIC_HOST']}:{os.environ['GATEWAY_PORT']}"
+gateway_host = os.environ.get("POLAR_GATEWAY_PRIMARY_HOST") or os.environ["POLAR_PUBLIC_HOST"]
+config["polar_gateway_url"] = f"http://{gateway_host}:{os.environ['GATEWAY_PORT']}"
 config["polar_agent_cli_dir"] = os.environ["AGENT_CLI_DIR"]
 config["polar_apptainer_image_dir"] = os.environ["APPTAINER_IMAGE_DIR"]
 config["polar_request_timeout"] = int(os.environ["POLAR_REQUEST_TIMEOUT"])
@@ -1165,13 +1177,28 @@ export_training_env() {
 
 service_pids=()
 
-gateway_node_id() {
+gateway_rank_allowed() {
     if [ "${polar_multi_gateway}" = "1" ]; then
         local rank="${SLURM_NODEID:-${SLURM_PROCID:-${RAY_NODE_RANK:-0}}}"
         case "${rank}" in
             ''|*[!0-9]*) die "invalid gateway rank: ${rank}" ;;
         esac
-        [ "${rank}" -lt "${polar_gateway_count}" ] || die "gateway rank ${rank} >= gateway count ${polar_gateway_count}"
+        local ranks="${polar_gateway_ranks:-}"
+        if [ -z "${ranks}" ]; then
+            ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
+        fi
+        case ",${ranks}," in
+            *,"${rank}",*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+gateway_node_id() {
+    if [ "${polar_multi_gateway}" = "1" ]; then
+        local rank="${SLURM_NODEID:-${SLURM_PROCID:-${RAY_NODE_RANK:-0}}}"
+        gateway_rank_allowed || die "rank ${rank} is not configured as a Polar gateway rank (${polar_gateway_ranks:-unset})"
         printf 'slurm-rank-%s\n' "${rank}"
     else
         printf 'localhost-node-01\n'
@@ -1202,13 +1229,18 @@ PY
 
 wait_gateway_fleet_ready() {
     [ "${polar_multi_gateway}" = "1" ] || return 0
-    "${python_bin}" - "${rollout_port}" "${polar_gateway_count}" <<'PY'
+    "${python_bin}" - "${rollout_port}" "${polar_gateway_count}" "${polar_gateway_ranks}" <<'PY'
 import json
 import sys
 import time
 import urllib.request
 
 port, expected = int(sys.argv[1]), int(sys.argv[2])
+ranks = [rank.strip() for rank in sys.argv[3].split(",") if rank.strip()]
+if not ranks:
+    ranks = [str(rank) for rank in range(expected)]
+if len(ranks) != expected:
+    raise SystemExit(f"expected {expected} gateway ranks, got {ranks}")
 url = f"http://127.0.0.1:{port}/nodes"
 deadline = time.time() + 240
 while time.time() < deadline:
@@ -1217,7 +1249,7 @@ while time.time() < deadline:
             payload = json.loads(resp.read().decode("utf-8"))
         healthy = [node for node in payload if node.get("healthy")]
         ids = {str(node.get("node_id")) for node in healthy}
-        want = {f"slurm-rank-{rank}" for rank in range(expected)}
+        want = {f"slurm-rank-{rank}" for rank in ranks}
         if ids == want:
             print(f"Polar gateway fleet healthy: {len(healthy)}/{expected}")
             raise SystemExit(0)
@@ -1332,15 +1364,18 @@ start_services_and_train() {
         service_pids+=("$!")
         sleep 2
 
-        local node_id
-        node_id="$(gateway_node_id)"
-        log "Starting Polar gateway ${node_id} on :${gateway_port}"
-        polar serve_gateway -c "${topology_path}" --node-id "${node_id}" >"${run_log_dir}/gateway.log" 2>&1 &
-        service_pids+=("$!")
-        sleep 2
-
         wait_http_health "rollout" "http://127.0.0.1:${rollout_port}/health" 60
-        wait_http_health "Polar gateway ${node_id}" "http://127.0.0.1:${gateway_port}/health" 60
+        if gateway_rank_allowed; then
+            local node_id
+            node_id="$(gateway_node_id)"
+            log "Starting Polar gateway ${node_id} on :${gateway_port}"
+            polar serve_gateway -c "${topology_path}" --node-id "${node_id}" >"${run_log_dir}/gateway.log" 2>&1 &
+            service_pids+=("$!")
+            sleep 2
+            wait_http_health "Polar gateway ${node_id}" "http://127.0.0.1:${gateway_port}/health" 60
+        else
+            log "Skipping local Polar gateway on non-gateway rank"
+        fi
         wait_gateway_fleet_ready
     else
         log "Debug rollout replay: skipping Polar rollout and gateway services"
@@ -1520,7 +1555,7 @@ PY
         --recompute-method uniform
         --recompute-num-layers 1
         "${batching_args[@]}"
-        --log-probs-chunk-size 256
+        --log-probs-chunk-size "${log_probs_chunk_size}"
         --advantage-estimator grpo
         --normalize-advantages
         "${tis_args[@]}"

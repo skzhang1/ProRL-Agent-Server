@@ -31,10 +31,10 @@ container_mounts="${container_mounts:-/lustre/fs1:/lustre/fs1,/lustre/fsw:/lustr
 # Apptainer 1.5.2 cannot re-enter an instance namespace from this Pyxis image.
 # Direct exec reuses the same host overlay and session bind across rollout stages.
 POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-1}"
-# Use clean pinned Slime/Megatron checkouts so earlier diagnostic edits cannot
-# leak into the production path.
-slime_dir="${slime_dir:-${project_root}/tmp/swegym_deps/slime_v030_fla04_clean}"
-megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM_2604_clean}"
+# Use the Slime/Megatron checkouts validated by the one-node and four-node
+# PI runs; these are project-local dependencies, not the old polar checkout.
+slime_dir="${slime_dir:-${project_root}/tmp/swegym_deps/slime}"
+megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM}"
 
 # Experiment shape. Keep the 4 x 16 group fixed so GRPO sees 64 samples/step.
 gpus_per_node=8
@@ -45,18 +45,18 @@ actor_num_nodes=1
 actor_num_gpus_per_node=8
 rollout_num_gpus=24
 rollout_num_gpus_per_engine=1
-tensor_model_parallel_size=2
+tensor_model_parallel_size="${tensor_model_parallel_size:-2}"
 qwen_gdn_backend=fla
 attention_backend=flash
 qkv_format=thd
 use_dynamic_batch_size=1
 use_sequence_parallel=1
 micro_batch_size=1
-global_batch_size=64
+global_batch_size="${global_batch_size:-64}"
 load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
-rollout_batch_size=4
-n_samples_per_prompt=16
+rollout_batch_size="${rollout_batch_size:-4}"
+n_samples_per_prompt="${n_samples_per_prompt:-16}"
 num_epoch=1
 # A ceil epoch is 74 optimizer updates. Slime numbers the first saved update as
 # iteration 1 after rollout 0, so the exclusive rollout boundary must be 75 to
@@ -75,10 +75,11 @@ exit_duration_minutes="${exit_duration_minutes:-190}"
 # Compact PI history before the 50k inference limit, then prefix-merge within
 # each segment. TP=2/DP=4 matches the launch_e2e-style training topology.
 max_tokens_per_gpu="${max_tokens_per_gpu:-50000}"
-rollout_max_response_len=16000
-rollout_max_prompt_len=32000
-sglang_context_length=50000
-sglang_mem_fraction_static=0.8
+log_probs_chunk_size="${log_probs_chunk_size:-256}"
+rollout_max_response_len="${rollout_max_response_len:-16000}"
+rollout_max_prompt_len="${rollout_max_prompt_len:-32000}"
+sglang_context_length="${sglang_context_length:-50000}"
+sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.8}"
 distributed_timeout_minutes=180
 save_interval=1
 
@@ -105,13 +106,14 @@ pi_max_tokens=512
 # that boundary instead of turning the session into a context-limit failure.
 pi_fail_on_context_limit=0
 polar_builder_strategy=prefix_merging
-polar_max_async_level=4
+polar_max_async_level="${polar_max_async_level:-4}"
 polar_min_complete_accept_fraction=0.6
-polar_multi_gateway=1
-polar_gateway_count=4
-polar_gateway_max_init_workers=24
-polar_gateway_max_run_workers=192
-polar_gateway_max_postrun_workers=96
+polar_multi_gateway="${polar_multi_gateway:-1}"
+polar_gateway_count="${polar_gateway_count:-4}"
+polar_gateway_ranks="${polar_gateway_ranks:-}"
+polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
+polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-192}"
+polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-96}"
 # Current Polar correctly rejects memory limits for the Apptainer backend.
 polar_runtime_memory_mb=""
 polar_task_timeout_seconds=900
@@ -246,7 +248,20 @@ head_node="${slurm_nodes[0]}"
 ray_head_ip="$(srun --overlap -N1 -n1 -w "${head_node}" hostname -I | awk '{print $1}')"
 [ -n "${ray_head_ip}" ] || die "failed to resolve Ray head IP"
 sglang_router_host="${ray_head_ip}"
-polar_gateway_hosts="$(IFS=,; printf '%s' "${slurm_nodes[*]}")"
+if [ -z "${polar_gateway_hosts:-}" ]; then
+    gateway_start=0
+    if [ "${polar_multi_gateway}" = "1" ] && [ "${polar_gateway_count}" -lt "${num_nodes}" ]; then
+        gateway_start=$((num_nodes - polar_gateway_count))
+    fi
+    gateway_nodes=("${slurm_nodes[@]:${gateway_start}:${polar_gateway_count}}")
+    [ "${#gateway_nodes[@]}" -eq "${polar_gateway_count}" ] || die "failed to select ${polar_gateway_count} gateway host(s)"
+    polar_gateway_hosts="$(IFS=,; printf '%s' "${gateway_nodes[*]}")"
+    if [ -z "${polar_gateway_ranks}" ]; then
+        polar_gateway_ranks="$(seq -s, "${gateway_start}" $((gateway_start + polar_gateway_count - 1)))"
+    fi
+elif [ -z "${polar_gateway_ranks}" ]; then
+    polar_gateway_ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
+fi
 
 # Lower-case variables are the inner launcher's public settings.
 export project_root script_dir train_sqsh container_mounts slime_dir megatron_dir
@@ -257,12 +272,12 @@ export attention_backend qkv_format use_dynamic_batch_size use_sequence_parallel
 export load_debug_rollout_data load_debug_rollout_data_subsample
 export rollout_batch_size n_samples_per_prompt num_epoch target_num_rollout num_rollout start_rollout_id smoke_rows
 export exit_duration_minutes
-export max_tokens_per_gpu rollout_max_response_len rollout_max_prompt_len
+export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
 export agent_harness agent_label pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
 export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
-export polar_multi_gateway polar_gateway_count polar_gateway_hosts
+export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
 export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export rollout_port gateway_port
@@ -278,6 +293,17 @@ set -euo pipefail
 rank="${SLURM_PROCID}"
 node="$(hostname)"
 node_ip="$(hostname -I | awk '{print $1}')"
+rank_is_gateway() {
+    [ "${polar_multi_gateway}" = "1" ] || return 1
+    local ranks="${polar_gateway_ranks:-}"
+    if [ -z "${ranks}" ]; then
+        ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
+    fi
+    case ",${ranks}," in
+        *,"${rank}",*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 cache_root="/tmp/webarea-pi-${SLURM_JOB_ID}-${rank}"
 export PATH="/opt/polr_venv/bin:/usr/local/cuda/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -381,7 +407,7 @@ PY
         --temp-dir="${ray_tmpdir}" --disable-usage-stats --block \
         >"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
     ray_pid="$!"
-    if [ "${polar_multi_gateway}" = "1" ]; then
+    if rank_is_gateway; then
         RAY_NODE_RANK="${rank}" pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
             bash "${script_dir}/run_pi_apptainer_train.sh" >"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
         gateway_pid="$!"
@@ -405,10 +431,10 @@ webarea PI SWE-Gym GRPO
   ray head:  ${ray_head_ip}
   account:   ${job_account}
   GPUs:      8 train + 24 rollout
-  gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}
+  gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}
   CPUs:      ${ray_num_cpus} per node
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
-  batch:     4 prompts x 16 samples = 64 trajectories
+  batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
   scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}
   boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id:-checkpoint})
   stability: lr=${train_lr}, KL=${kl_loss_coef}, clip=${clip_grad}
