@@ -26,6 +26,7 @@ class ApptainerRuntime(BaseRuntime):
         safe_name = session_id.replace("/", "-")[:30]
         self._instance_name = f"polar-{safe_name}-{short_hash}"
         self._binary = self._resolve_binary()
+        self._direct_exec = os.environ.get("POLAR_APPTAINER_DIRECT_EXEC", "0") == "1"
 
     @property
     def runtime_id(self) -> str:
@@ -46,6 +47,8 @@ class ApptainerRuntime(BaseRuntime):
         # (default tmpfs overlay is only 64 MB, too small for most workloads).
         self._overlay_dir = self.session_dir / "overlay"
         self._overlay_dir.mkdir(parents=True, exist_ok=True)
+        if self._direct_exec:
+            return
         args = [self._binary, "instance", "start",
                 "--overlay", str(self._overlay_dir)]
         if self.spec.gpus > 0:
@@ -76,6 +79,8 @@ class ApptainerRuntime(BaseRuntime):
         if self._destroyed:
             return
         self._destroyed = True
+        if self._direct_exec:
+            return
         rc, _, stderr = await self._run_local_command(
             self._binary, "instance", "stop", self._instance_name,
             timeout=self._STOP_TIMEOUT, capture=True,
@@ -105,7 +110,20 @@ class ApptainerRuntime(BaseRuntime):
                 shell_exports.append(f"export {key}={shlex.quote(str(effective_env[key]))};")
         if shell_exports:
             wrapped_command = " ".join(shell_exports + [wrapped_command])
-        args = [self._binary, "exec", f"instance://{self._instance_name}"]
+        args = [self._binary, "exec"]
+        if self._direct_exec:
+            args.extend(["--overlay", str(self._overlay_dir)])
+            if self.spec.gpus > 0:
+                args.append("--nv")
+            network_name = "none" if not self.spec.allow_internet else self.spec.network
+            if network_name and network_name != "host":
+                args.extend(["--net", "--network", network_name])
+            args.extend(["--bind", f"{self.session_dir}:{self.runtime_session_dir}"])
+            for volume in self.spec.kwargs.get("volumes", []):
+                args.extend(["--bind", str(volume)])
+            args.append(self.spec.image)
+        else:
+            args.append(f"instance://{self._instance_name}")
         if effective_env:
             args.append("env")
             args.extend(f"{key}={value}" for key, value in effective_env.items())

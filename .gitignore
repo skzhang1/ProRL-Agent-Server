@@ -121,3 +121,5 @@ docs/
 # Dashboard frontend build artifacts
 web/node_modules/
 web/dist/
+
+hao_example/

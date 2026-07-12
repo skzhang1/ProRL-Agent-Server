@@ -29,14 +29,24 @@ mkdir -p "$OUTPUT_DIR"
 
 # shellcheck source=./model_args.sh
 source "${SCRIPT_DIR}/model_args.sh"
+CONVERT_MODEL_ARGS=()
+for model_arg in "${MODEL_ARGS[@]}"; do
+    if [ "${model_arg}" = "--use-gated-attention" ] && \
+        ! grep -R -- "--use-gated-attention" "${MEGATRON_DIR}/megatron/training" >/dev/null 2>&1; then
+        echo "Skipping --use-gated-attention; this Megatron checkout does not expose that CLI flag."
+        continue
+    fi
+    CONVERT_MODEL_ARGS+=("${model_arg}")
+done
 
 echo "Converting ${HF_CHECKPOINT} -> ${OUTPUT_DIR}"
 
+env -u NVTE_FLASH_ATTN -u NVTE_FUSED_ATTN -u NVTE_UNFUSED_ATTN \
 CUDA_DEVICE_MAX_CONNECTIONS=1 \
 PYTHONPATH="${MEGATRON_DIR}:${SLIME_DIR}:${PROJECT_ROOT}/src" \
 torchrun --nproc_per_node 1 \
     "${SLIME_DIR}/tools/convert_hf_to_torch_dist.py" \
-    "${MODEL_ARGS[@]}" \
+    "${CONVERT_MODEL_ARGS[@]}" \
     --hf-checkpoint "$HF_CHECKPOINT" \
     --save "$OUTPUT_DIR" \
     --tensor-model-parallel-size 1 \
