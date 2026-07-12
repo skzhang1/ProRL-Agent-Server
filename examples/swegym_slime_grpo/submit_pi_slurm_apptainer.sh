@@ -33,8 +33,8 @@ container_mounts="${container_mounts:-/lustre/fs1:/lustre/fs1,/lustre/fsw:/lustr
 POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-1}"
 # Use clean pinned Slime/Megatron checkouts so earlier diagnostic edits cannot
 # leak into the production path.
-slime_dir="${project_root}/tmp/swegym_deps/slime_v030_fla04_clean"
-megatron_dir="${project_root}/tmp/swegym_deps/Megatron-LM_2604_clean"
+slime_dir="${slime_dir:-${project_root}/tmp/swegym_deps/slime_v030_fla04_clean}"
+megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM_2604_clean}"
 
 # Experiment shape. Keep the 4 x 16 group fixed so GRPO sees 64 samples/step.
 gpus_per_node=8
@@ -74,7 +74,7 @@ exit_duration_minutes="${exit_duration_minutes:-190}"
 
 # Compact PI history before the 50k inference limit, then prefix-merge within
 # each segment. TP=2/DP=4 matches the launch_e2e-style training topology.
-max_tokens_per_gpu=30000
+max_tokens_per_gpu="${max_tokens_per_gpu:-50000}"
 rollout_max_response_len=16000
 rollout_max_prompt_len=32000
 sglang_context_length=50000
