@@ -36,7 +36,7 @@ POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-1}"
 slime_dir="${slime_dir:-${project_root}/tmp/swegym_deps/slime}"
 megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM}"
 
-# Experiment shape. Keep the 4 x 16 group fixed so GRPO sees 64 samples/step.
+# Experiment shape. The validated full-run default uses 8 prompt groups x 8 samples = 64 samples/step.
 gpus_per_node=8
 num_nodes=4
 total_gpus=32
@@ -45,7 +45,7 @@ actor_num_nodes=1
 actor_num_gpus_per_node=8
 rollout_num_gpus=24
 rollout_num_gpus_per_engine=1
-tensor_model_parallel_size="${tensor_model_parallel_size:-2}"
+tensor_model_parallel_size="${tensor_model_parallel_size:-4}"
 qwen_gdn_backend=fla
 attention_backend=flash
 qkv_format=thd
@@ -55,14 +55,14 @@ micro_batch_size=1
 global_batch_size="${global_batch_size:-64}"
 load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
-rollout_batch_size="${rollout_batch_size:-4}"
-n_samples_per_prompt="${n_samples_per_prompt:-16}"
-num_epoch=1
-# A ceil epoch is 74 optimizer updates. Slime numbers the first saved update as
-# iteration 1 after rollout 0, so the exclusive rollout boundary must be 75 to
-# produce iter_0000074. Singleton allocations discover the latest checkpoint
-# and keep that global boundary. An explicit num_rollout keeps manual mode.
-target_num_rollout="${target_num_rollout:-75}"
+rollout_batch_size="${rollout_batch_size:-8}"
+n_samples_per_prompt="${n_samples_per_prompt:-8}"
+num_epoch=2
+# Two ceil epochs are 74 optimizer updates with 293 prompts and 8 prompts/step.
+# Slime saves checkpoint iteration 0 after rollout 0, so the exclusive rollout
+# boundary must be 74 to produce iter_0000073. Singleton allocations discover
+# the latest checkpoint and keep that global boundary. An explicit num_rollout keeps manual mode.
+target_num_rollout="${target_num_rollout:-74}"
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
@@ -72,19 +72,19 @@ smoke_rows="${smoke_rows:-0}"
 # the four-hour Slurm allocation.
 exit_duration_minutes="${exit_duration_minutes:-190}"
 
-# Compact PI history before the 50k inference limit, then prefix-merge within
-# each segment. TP=2/DP=4 matches the launch_e2e-style training topology.
-max_tokens_per_gpu="${max_tokens_per_gpu:-50000}"
-log_probs_chunk_size="${log_probs_chunk_size:-256}"
+# Compact PI history before the 60k inference limit, then prefix-merge within
+# each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
+max_tokens_per_gpu="${max_tokens_per_gpu:-60000}"
+log_probs_chunk_size="${log_probs_chunk_size:-64}"
 rollout_max_response_len="${rollout_max_response_len:-16000}"
 rollout_max_prompt_len="${rollout_max_prompt_len:-32000}"
-sglang_context_length="${sglang_context_length:-50000}"
-sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.8}"
+sglang_context_length="${sglang_context_length:-60000}"
+sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.7}"
 distributed_timeout_minutes=180
 save_interval=1
 
 # Long tool trajectories can overflow the exponential ratios in low_var_kl and
-# built-in TIS even with a 30k token cap. Use the bounded k2 form and a lower LR.
+# built-in TIS even with a long token cap. Use the bounded k2 form and a lower LR.
 train_lr=5e-7
 clip_grad=0.5
 kl_loss_coef=0.001
@@ -99,7 +99,7 @@ agent_harness=pi
 agent_label=pi
 pi_api_type=openai-completions
 # Trigger PI compaction early enough to absorb a large tool result without
-# overshooting SGLang's hard 50k request limit.
+# overshooting SGLang's hard 60k request limit.
 pi_context_window=24000
 pi_max_tokens=512
 # Compaction creates a clean prefix break; prefix_merging starts a new trace at
@@ -109,21 +109,21 @@ polar_builder_strategy=prefix_merging
 polar_max_async_level="${polar_max_async_level:-4}"
 polar_min_complete_accept_fraction=0.6
 polar_multi_gateway="${polar_multi_gateway:-1}"
-polar_gateway_count="${polar_gateway_count:-4}"
+polar_gateway_count="${polar_gateway_count:-3}"
 polar_gateway_ranks="${polar_gateway_ranks:-}"
 polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
-polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-192}"
-polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-96}"
+polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-96}"
+polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-64}"
 # Current Polar correctly rejects memory limits for the Apptainer backend.
 polar_runtime_memory_mb=""
 polar_task_timeout_seconds=900
 polar_request_timeout=900
 
-# Stable identity shared by checkpoints and W&B.  Like MODEL_NAME in the SFT
-# singleton launcher, edit/override experiment_name once when starting a new
-# experiment; repeated plain `sbatch` calls then resume this same run.
-run_label="4n32g-train8-rollout24-tp2dp4-fa4b19-fla04-pmerge-k2"
-experiment_name="${experiment_name:-webarea-distill_pi_q35_4n_full293_1ep_$(date -u +%Y%m%dT%H%M%SZ)}"
+# Stable identity shared by checkpoints and W&B. The default is intentionally
+# timestamp-free so repeated plain `sbatch` calls resume the same full run.
+# Override experiment_name once when starting a new experiment.
+run_label="${run_label:-4n32g-train8-rollout24-tp4dp2-8x8-60k-3gw-2ep-fa4b19-pmerge-k2}"
+experiment_name="${experiment_name:-webarea-distill_pi_q35_4n_full293_2ep_tp4dp2_8x8_60k_3gw}"
 run_id="${run_id:-${experiment_name}}"
 run_dir="${run_dir:-${project_root}/tmp/${run_id}}"
 run_log_dir="${run_log_dir:-${run_dir}/logs/job-${SLURM_JOB_ID}}"
@@ -179,7 +179,8 @@ esac
 case "${exit_duration_minutes}" in
     ''|*[!0-9]*) die "exit_duration_minutes must be a positive integer" ;;
 esac
-[ "${target_num_rollout}" -eq 75 ] || die "target_num_rollout must remain 75 to produce checkpoint iteration 74"
+[ "${target_num_rollout}" -eq 74 ] || \
+    die "target_num_rollout must remain 74 to produce checkpoint iteration 73 for two 293-row epochs at 8 prompts/step"
 [ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
 
 # Automatic singleton resume.  Slime writes checkpoint iteration N only after
@@ -245,19 +246,59 @@ rm -f "${stop_file}"
 mapfile -t slurm_nodes < <(scontrol show hostnames "${SLURM_NODELIST}")
 [ "${#slurm_nodes[@]}" -eq 4 ] || die "expected four Slurm hosts"
 head_node="${slurm_nodes[0]}"
-ray_head_ip="$(srun --overlap -N1 -n1 -w "${head_node}" hostname -I | awk '{print $1}')"
-[ -n "${ray_head_ip}" ] || die "failed to resolve Ray head IP"
+slime_train_node=""
+slime_train_rank=""
+slime_train_ip=""
+slurm_node_records=()
+for idx in "${!slurm_nodes[@]}"; do
+    node="${slurm_nodes[$idx]}"
+    node_ip="$(srun --overlap -N1 -n1 -w "${node}" hostname -I | awk '{print $1}')"
+    [ -n "${node_ip}" ] || die "failed to resolve node IP for ${node}"
+    slurm_node_records+=("${idx}:${node}:${node_ip}")
+    if [ "${idx}" = "0" ]; then
+        ray_head_ip="${node_ip}"
+    fi
+done
+[ -n "${ray_head_ip:-}" ] || die "failed to resolve Ray head IP"
 sglang_router_host="${ray_head_ip}"
 if [ -z "${polar_gateway_hosts:-}" ]; then
-    gateway_start=0
     if [ "${polar_multi_gateway}" = "1" ] && [ "${polar_gateway_count}" -lt "${num_nodes}" ]; then
-        gateway_start=$((num_nodes - polar_gateway_count))
-    fi
-    gateway_nodes=("${slurm_nodes[@]:${gateway_start}:${polar_gateway_count}}")
-    [ "${#gateway_nodes[@]}" -eq "${polar_gateway_count}" ] || die "failed to select ${polar_gateway_count} gateway host(s)"
-    polar_gateway_hosts="$(IFS=,; printf '%s' "${gateway_nodes[*]}")"
-    if [ -z "${polar_gateway_ranks}" ]; then
-        polar_gateway_ranks="$(seq -s, "${gateway_start}" $((gateway_start + polar_gateway_count - 1)))"
+        mapfile -t gateway_selection < <(python3 - "${polar_gateway_count}" "${slurm_node_records[@]}" <<'PYSEL'
+import ipaddress
+import sys
+count = int(sys.argv[1])
+records = []
+for raw in sys.argv[2:]:
+    rank, node, ip = raw.split(":", 2)
+    records.append((ipaddress.ip_address(ip), int(rank), node, ip))
+records.sort(key=lambda item: (item[0], item[1]))
+train = records[0]
+gateways = records[1:1 + count]
+if len(gateways) != count:
+    raise SystemExit(f"failed to select {count} non-train gateway host(s)")
+print(f"TRAIN_NODE={train[2]}")
+print(f"TRAIN_RANK={train[1]}")
+print(f"TRAIN_IP={train[3]}")
+print("GATEWAY_HOSTS=" + ",".join(item[2] for item in gateways))
+print("GATEWAY_RANKS=" + ",".join(str(item[1]) for item in gateways))
+PYSEL
+)
+        for item in "${gateway_selection[@]}"; do
+            case "${item}" in
+                TRAIN_NODE=*) slime_train_node="${item#TRAIN_NODE=}" ;;
+                TRAIN_RANK=*) slime_train_rank="${item#TRAIN_RANK=}" ;;
+                TRAIN_IP=*) slime_train_ip="${item#TRAIN_IP=}" ;;
+                GATEWAY_HOSTS=*) polar_gateway_hosts="${item#GATEWAY_HOSTS=}" ;;
+                GATEWAY_RANKS=*) polar_gateway_ranks="${item#GATEWAY_RANKS=}" ;;
+            esac
+        done
+    else
+        gateway_nodes=("${slurm_nodes[@]:0:${polar_gateway_count}}")
+        [ "${#gateway_nodes[@]}" -eq "${polar_gateway_count}" ] || die "failed to select ${polar_gateway_count} gateway host(s)"
+        polar_gateway_hosts="$(IFS=,; printf '%s' "${gateway_nodes[*]}")"
+        if [ -z "${polar_gateway_ranks}" ]; then
+            polar_gateway_ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
+        fi
     fi
 elif [ -z "${polar_gateway_ranks}" ]; then
     polar_gateway_ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
@@ -429,6 +470,7 @@ webarea PI SWE-Gym GRPO
   run:       ${run_id}
   nodes:     ${slurm_nodes[*]}
   ray head:  ${ray_head_ip}
+  train node:${slime_train_node:-slime-placement-default}${slime_train_rank:+ (rank ${slime_train_rank}, ip ${slime_train_ip})}
   account:   ${job_account}
   GPUs:      8 train + 24 rollout
   gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}
