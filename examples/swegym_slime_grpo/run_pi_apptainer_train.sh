@@ -261,6 +261,10 @@ polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-96}"
 polar_runtime_memory_mb="${polar_runtime_memory_mb:-}"
 polar_task_timeout_seconds="${polar_task_timeout_seconds:-1200}"
 polar_request_timeout="${polar_request_timeout:-1200}"
+use_fault_tolerance="${use_fault_tolerance:-0}"
+rollout_health_check_interval="${rollout_health_check_interval:-30}"
+rollout_health_check_timeout="${rollout_health_check_timeout:-30}"
+rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 log_probs_chunk_size="${log_probs_chunk_size:-256}"
 pi_api_type="${pi_api_type:-openai-completions}"
 pi_max_tokens="${pi_max_tokens:-512}"
@@ -1486,6 +1490,16 @@ PY
         tis_args=(--use-tis)
     fi
 
+    local fault_tolerance_args=()
+    if [ "${use_fault_tolerance}" = "1" ]; then
+        fault_tolerance_args=(
+            --use-fault-tolerance
+            --rollout-health-check-interval "${rollout_health_check_interval}"
+            --rollout-health-check-timeout "${rollout_health_check_timeout}"
+            --rollout-health-check-first-wait "${rollout_health_check_first_wait}"
+        )
+    fi
+
     local batching_args=()
     if [ "${use_dynamic_batch_size}" = "1" ]; then
         batching_args=(
@@ -1544,6 +1558,7 @@ PY
         --dynamic-history
         --num-steps-per-rollout "${num_steps_per_rollout}"
         --distributed-timeout-minutes "${distributed_timeout_minutes}"
+        "${fault_tolerance_args[@]}"
         --qwen-gdn-backend "${qwen_gdn_backend}"
         --tensor-model-parallel-size "${tensor_model_parallel_size}"
         "${sequence_parallel_args[@]}"
@@ -1654,6 +1669,7 @@ if [ -n "${anthropic_max_tokens}" ]; then
 fi
 log "GPU split: total=${total_gpus}, train=${train_num_gpus}, rollout=${rollout_num_gpus}, tp=${tensor_model_parallel_size}"
 log "Batch: rollout=${rollout_batch_size}, samples/prompt=${n_samples_per_prompt}, num_rollout=${num_rollout:-epoch}"
+log "Rollout fault tolerance: ${use_fault_tolerance} (interval=${rollout_health_check_interval}s, timeout=${rollout_health_check_timeout}s)"
 log "Rollout start: ${start_rollout_id:-checkpoint}"
 log "W&B: entity=${wandb_entity}, project=${wandb_project}, group=${wandb_group}, run_id=${wandb_run_id}"
 

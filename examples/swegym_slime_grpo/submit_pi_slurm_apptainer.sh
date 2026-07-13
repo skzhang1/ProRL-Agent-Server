@@ -119,6 +119,12 @@ polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-64}"
 polar_runtime_memory_mb=""
 polar_task_timeout_seconds=900
 polar_request_timeout=900
+# Let Slime detect and recreate a rollout SGLang server whose HTTP process dies
+# while the Ray actor remains alive. This avoids failing later in update_weights.
+use_fault_tolerance="${use_fault_tolerance:-1}"
+rollout_health_check_interval="${rollout_health_check_interval:-30}"
+rollout_health_check_timeout="${rollout_health_check_timeout:-30}"
+rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 
 # Stable identity shared by checkpoints and W&B. The default is intentionally
 # timestamp-free so repeated plain `sbatch` calls resume the same full run.
@@ -154,6 +160,11 @@ ray_dashboard_port="${ray_dashboard_port:-28265}"
 ray_num_cpus=128
 ray_expected_num_gpus=32
 ray_cluster_timeout_seconds=600
+# Ray must see this before `ray start`; the inner trainer starts too late to
+# affect raylet's host-memory monitor. 0.99 avoids false kills from SGLang/CUDA
+# mappings while still leaving the OS cgroup as the final guardrail.
+ray_memory_usage_threshold="${ray_memory_usage_threshold:-0.99}"
+ray_memory_monitor_refresh_ms="${ray_memory_monitor_refresh_ms:-}"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -322,10 +333,12 @@ export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fr
 export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
 export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
+export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
 export rollout_port gateway_port
 export run_id run_label run_dir run_log_dir save_dir rollout_save_dir
 export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key
 export dry_run ray_port ray_dashboard_port ray_num_cpus ray_expected_num_gpus ray_cluster_timeout_seconds
+export ray_memory_usage_threshold ray_memory_monitor_refresh_ms
 export ray_head_ip sglang_router_host stop_file
 
 cat >"${worker_script}" <<'WORKER'
@@ -365,6 +378,11 @@ export XDG_RUNTIME_DIR="${cache_root}/xdg-runtime"
 export CUDA_CACHE_PATH="${cache_root}/cuda-cache"
 export NUMBA_CACHE_DIR="${cache_root}/numba"
 export ray_tmpdir="${cache_root}/ray"
+export RAY_MEMORY_USAGE_THRESHOLD="${ray_memory_usage_threshold:-0.99}"
+export RAY_memory_usage_threshold="${RAY_MEMORY_USAGE_THRESHOLD}"
+if [ -n "${ray_memory_monitor_refresh_ms:-}" ]; then
+    export RAY_memory_monitor_refresh_ms="${ray_memory_monitor_refresh_ms}"
+fi
 mkdir -p "${HOME}" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" "${APPTAINER_WORKDIR}" \
     "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${XDG_CACHE_HOME}" \
     "${XDG_CONFIG_HOME}" "${XDG_RUNTIME_DIR}" "${CUDA_CACHE_PATH}" "${NUMBA_CACHE_DIR}" "${ray_tmpdir}"
@@ -391,6 +409,7 @@ patch_container_runtime_only=1 bash "${script_dir}/run_pi_apptainer_train.sh" \
 
 ray stop --force >/dev/null 2>&1 || true
 monitor_pid=""
+mem_monitor_pid=""
 gateway_pid=""
 preserve_ray_logs() {
     local source_dir="${ray_tmpdir}/session_latest/logs"
@@ -399,11 +418,15 @@ preserve_ray_logs() {
     mkdir -p "${target_dir}"
     find -L "${source_dir}" -maxdepth 1 -type f \
         \( -name 'gcs_server.*' -o -name 'raylet.*' \
-           -o -name 'ray_process_exit.log' -o -name 'dashboard*.log' \) \
+           -o -name 'ray_process_exit.log' -o -name 'dashboard*.log' \
+          -o -name 'worker*.out' -o -name 'worker*.err' \
+          -o -name 'python-core-worker*.log' -o -name 'runtime_env*.log' \
+          -o -name 'log_monitor.*' \) \
         -exec cp -f {} "${target_dir}/" \; 2>/dev/null || true
 }
 cleanup() {
     [ -z "${monitor_pid}" ] || kill "${monitor_pid}" 2>/dev/null || true
+    [ -z "${mem_monitor_pid}" ] || kill "${mem_monitor_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || kill "${gateway_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || wait "${gateway_pid}" 2>/dev/null || true
     preserve_ray_logs
@@ -421,6 +444,16 @@ trap cleanup EXIT
     done
 ) >>"${run_log_dir}/gpu-rank-${rank}.csv" 2>&1 &
 monitor_pid="$!"
+
+(
+    while true; do
+        printf 'timestamp=%s node=%s rank=%s\n' "$(date -u +%FT%TZ)" "${node}" "${rank}"
+        free -g || true
+        ps -eo pid,ppid,rss,vsz,comm,args --sort=-rss | head -16 || true
+        sleep 30
+    done
+) >>"${run_log_dir}/mem-rank-${rank}.log" 2>&1 &
+mem_monitor_pid="$!"
 
 if [ "${rank}" = "0" ]; then
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
@@ -480,11 +513,12 @@ webarea PI SWE-Gym GRPO
   GPUs:      8 train + 24 rollout
   gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}
   CPUs:      ${ray_num_cpus} per node
+  Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
   scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}
   boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id:-checkpoint})
-  stability: lr=${train_lr}, KL=${kl_loss_coef}, clip=${clip_grad}
+  stability: lr=${train_lr}, KL=${kl_loss_coef}, clip=${clip_grad}, rollout_ft=${use_fault_tolerance}
   W&B:       ${wandb_entity}/${wandb_project}/${wandb_run_id}
 ============================================================
 SUMMARY
