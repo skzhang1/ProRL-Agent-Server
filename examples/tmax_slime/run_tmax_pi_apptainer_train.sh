@@ -242,6 +242,9 @@ start_rollout_id="${start_rollout_id:-}"
 num_steps_per_rollout="${num_steps_per_rollout:-1}"
 distributed_timeout_minutes="${distributed_timeout_minutes:-180}"
 sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.8}"
+sglang_cuda_graph_max_bs="${sglang_cuda_graph_max_bs:-}"
+sglang_disable_cuda_graph="${sglang_disable_cuda_graph:-0}"
+sglang_disable_custom_all_reduce="${sglang_disable_custom_all_reduce:-0}"
 sglang_log_level="${sglang_log_level:-warning}"
 qwen_gdn_backend="${qwen_gdn_backend:-flashqla}"
 attention_backend="${attention_backend:-flash}"
@@ -289,6 +292,9 @@ rollout_port="${rollout_port:-18080}"
 gateway_port="${gateway_port:-18100}"
 sglang_router_port="${sglang_router_port:-26000}"
 slime_sglang_base_port="${slime_sglang_base_port:-34000}"
+cleanup_stale_sglang="${cleanup_stale_sglang:-1}"
+polar_gateway_sidecar_topology_timeout="${polar_gateway_sidecar_topology_timeout:-900}"
+polar_gateway_sidecar_rollout_health_timeout="${polar_gateway_sidecar_rollout_health_timeout:-900}"
 ray_port="${ray_port:-6379}"
 ray_dashboard_port="${ray_dashboard_port:-28265}"
 ray_head_ip="${ray_head_ip:-$(detect_host_ip)}"
@@ -590,6 +596,29 @@ if old in text:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 elif new not in text:
     raise SystemExit(f"unexpected Slime Gloo compatibility block in {path}")
+PY
+    # Slime defaults rollout worker ports to 15000 on every node. On a busy
+    # shared cluster, stale SGLang workers or concurrent jobs can leave those
+    # fixed ports occupied, which makes the router keep dead worker URLs such
+    # as http://host:15000. Honor the job-scoped base port exported by this
+    # launcher so each Slurm allocation gets its own worker port block.
+    "${python_bin}" - "${slime_dir}/slime/ray/rollout.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = '''            base_port = max(port_cursors.values()) if port_cursors else 15000
+'''
+new = '''            env_base_port = int(os.environ.get("SLIME_SGLANG_BASE_PORT", "15000"))
+            base_port = max(port_cursors.values()) if port_cursors else env_base_port
+'''
+if new in text:
+    pass
+elif old in text:
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+else:
+    raise SystemExit(f"unexpected Slime rollout base_port block in {path}")
 PY
     # Slime exposes dual-clip PPO but currently omits eps_clip_c at the call
     # site, and exponentiates an unbounded log-ratio before clipping. One
@@ -1216,6 +1245,36 @@ gateway_node_id() {
     fi
 }
 
+cleanup_stale_sglang_processes() {
+    if [ "${cleanup_stale_sglang}" != "1" ]; then
+        log "cleanup_stale_sglang=${cleanup_stale_sglang}; skipping stale SGLang cleanup"
+        return
+    fi
+    if ! command -v pgrep >/dev/null 2>&1; then
+        log "pgrep not available; skipping stale SGLang cleanup"
+        return
+    fi
+
+    local user_id
+    user_id="$(id -u)"
+    local pattern='SGLangEngine|sglang_router|sglang[.]srt|sglang[.]launch'
+    local pids
+    pids="$(pgrep -u "${user_id}" -f "${pattern}" || true)"
+    if [ -z "${pids}" ]; then
+        log "No stale SGLang/router processes found on $(hostname)"
+        return
+    fi
+
+    log "Stopping stale SGLang/router processes on $(hostname): $(printf '%s' "${pids}" | tr '\n' ' ')"
+    kill ${pids} >/dev/null 2>&1 || true
+    sleep 2
+    pids="$(pgrep -u "${user_id}" -f "${pattern}" || true)"
+    if [ -n "${pids}" ]; then
+        log "Force-stopping stale SGLang/router processes on $(hostname): $(printf '%s' "${pids}" | tr '\n' ' ')"
+        kill -9 ${pids} >/dev/null 2>&1 || true
+    fi
+}
+
 wait_http_health() {
     local name="$1"
     local url="$2"
@@ -1276,13 +1335,15 @@ start_gateway_sidecar() {
     export_training_env
     topology_path="${run_dir}/topology.yaml"
     custom_config_path="${run_dir}/polar_config.yaml"
-    for _ in $(seq 1 180); do
+    log "Gateway sidecar waiting for topology/config up to ${polar_gateway_sidecar_topology_timeout}s"
+    local deadline=$((SECONDS + polar_gateway_sidecar_topology_timeout))
+    while [ "${SECONDS}" -lt "${deadline}" ]; do
         [ -s "${topology_path}" ] && [ -s "${custom_config_path}" ] && break
         sleep 1
     done
-    [ -s "${topology_path}" ] || die "sidecar timed out waiting for topology: ${topology_path}"
-    [ -s "${custom_config_path}" ] || die "sidecar timed out waiting for Polar config: ${custom_config_path}"
-    wait_http_health "remote Polar rollout" "http://${ray_head_ip}:${rollout_port}/health" 180
+    [ -s "${topology_path}" ] || die "sidecar timed out after ${polar_gateway_sidecar_topology_timeout}s waiting for topology: ${topology_path}"
+    [ -s "${custom_config_path}" ] || die "sidecar timed out after ${polar_gateway_sidecar_topology_timeout}s waiting for Polar config: ${custom_config_path}"
+    wait_http_health "remote Polar rollout" "http://${ray_head_ip}:${rollout_port}/health" "${polar_gateway_sidecar_rollout_health_timeout}"
 
     service_pids=()
     cleanup_sidecar() {
@@ -1536,6 +1597,21 @@ PY
         *) die "grpo_std_normalization must be 0/1/false/true; got ${grpo_std_normalization}" ;;
     esac
 
+    local sglang_graph_args=()
+    if [ -n "${sglang_cuda_graph_max_bs}" ]; then
+        sglang_graph_args+=(--sglang-cuda-graph-max-bs "${sglang_cuda_graph_max_bs}")
+    fi
+    case "${sglang_disable_custom_all_reduce}" in
+        1|true) sglang_graph_args+=(--sglang-disable-custom-all-reduce) ;;
+        0|false) ;;
+        *) die "sglang_disable_custom_all_reduce must be 0/1/false/true; got ${sglang_disable_custom_all_reduce}" ;;
+    esac
+    case "${sglang_disable_cuda_graph}" in
+        1|true) sglang_graph_args+=(--sglang-disable-cuda-graph) ;;
+        0|false) ;;
+        *) die "sglang_disable_cuda_graph must be 0/1/false/true; got ${sglang_disable_cuda_graph}" ;;
+    esac
+
     local train_args=(
         "${slime_dir}/train_async.py"
         --actor-num-nodes "${actor_num_nodes}"
@@ -1625,6 +1701,7 @@ PY
         --sglang-served-model-name "${model_name}"
         --sglang-tool-call-parser qwen3_coder
         --sglang-log-level "${sglang_log_level}"
+        "${sglang_graph_args[@]}"
         --router-policy "${sglang_router_policy:-round_robin}"
         --sglang-router-port "${sglang_router_port}"
         "${wandb_args[@]}"
@@ -1689,6 +1766,7 @@ if [ -n "${anthropic_max_tokens}" ]; then
 fi
 log "GPU split: total=${total_gpus}, train=${train_num_gpus}, rollout=${rollout_num_gpus}, tp=${tensor_model_parallel_size}"
 log "Batch: rollout=${rollout_batch_size}, samples/prompt=${n_samples_per_prompt}, num_rollout=${num_rollout:-epoch}"
+log "SGLang: mem_fraction=${sglang_mem_fraction_static}, cuda_graph_max_bs=${sglang_cuda_graph_max_bs:-default}, disable_custom_all_reduce=${sglang_disable_custom_all_reduce}, disable_cuda_graph=${sglang_disable_cuda_graph}"
 log "DAPO: dynamic_sampling=${dynamic_sampling_filter_path:-off}, per_token_loss=${calculate_per_token_loss}, grpo_std_normalization=${grpo_std_normalization}, kl_loss_coef=${kl_loss_coef}"
 log "Rollout start: ${start_rollout_id:-checkpoint}"
 log "W&B: entity=${wandb_entity}, project=${wandb_project}, group=${wandb_group}, run_id=${wandb_run_id}"
@@ -1716,4 +1794,5 @@ if [ "${dry_run}" = "1" ]; then
     exit 0
 fi
 
+cleanup_stale_sglang_processes
 start_services_and_train

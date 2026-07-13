@@ -115,6 +115,7 @@ polar_gateway_ranks="${polar_gateway_ranks:-}"
 polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
 polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-96}"
 polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-64}"
+polar_gateway_max_restarts="${polar_gateway_max_restarts:-20}"
 # Current Polar correctly rejects memory limits for the Apptainer backend.
 polar_runtime_memory_mb=""
 polar_task_timeout_seconds=900
@@ -332,6 +333,7 @@ export agent_harness agent_label pi_api_type pi_context_window pi_max_tokens pi_
 export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
 export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
+export polar_gateway_max_restarts
 export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
 export rollout_port gateway_port
@@ -486,15 +488,36 @@ PY
         --temp-dir="${ray_tmpdir}" --disable-usage-stats "${ray_log_monitor_args[@]}" --block \
         >"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
     ray_pid="$!"
-    if rank_is_gateway; then
+    gateway_restarts=0
+    start_gateway_sidecar_bg() {
+        printf '[%s] starting gateway sidecar rank=%s restart=%s\n' \
+            "$(date -u +%FT%TZ)" "${rank}" "${gateway_restarts}" \
+            >>"${run_log_dir}/gateway-sidecar-rank-${rank}.supervisor.log"
         RAY_NODE_RANK="${rank}" pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
-            bash "${script_dir}/run_pi_apptainer_train.sh" >"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
+            bash "${script_dir}/run_pi_apptainer_train.sh" >>"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
         gateway_pid="$!"
+    }
+    if rank_is_gateway; then
+        start_gateway_sidecar_bg
     fi
     while [ ! -f "${stop_file}" ]; do
         kill -0 "${ray_pid}" 2>/dev/null || { wait "${ray_pid}"; exit $?; }
-        if [ -n "${gateway_pid}" ]; then
-            kill -0 "${gateway_pid}" 2>/dev/null || { wait "${gateway_pid}"; exit $?; }
+        if [ -n "${gateway_pid}" ] && ! kill -0 "${gateway_pid}" 2>/dev/null; then
+            set +e
+            wait "${gateway_pid}"
+            gateway_rc="$?"
+            set -e
+            printf '[%s] gateway sidecar rank=%s exited rc=%s restart=%s\n' \
+                "$(date -u +%FT%TZ)" "${rank}" "${gateway_rc}" "${gateway_restarts}" \
+                >>"${run_log_dir}/gateway-sidecar-rank-${rank}.supervisor.log"
+            gateway_restarts=$((gateway_restarts + 1))
+            if [ "${gateway_restarts}" -gt "${polar_gateway_max_restarts}" ]; then
+                printf 'ERROR: gateway sidecar rank=%s exceeded restart limit %s\n' \
+                    "${rank}" "${polar_gateway_max_restarts}" >&2
+                exit "${gateway_rc}"
+            fi
+            sleep 5
+            start_gateway_sidecar_bg
         fi
         sleep 5
     done
@@ -511,7 +534,7 @@ webarea PI SWE-Gym GRPO
   train node:${slime_train_node:-slime-placement-default}${slime_train_rank:+ (rank ${slime_train_rank}, ip ${slime_train_ip})}
   account:   ${job_account}
   GPUs:      8 train + 24 rollout
-  gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}
+  gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}, restarts=${polar_gateway_max_restarts}
   CPUs:      ${ray_num_cpus} per node
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
