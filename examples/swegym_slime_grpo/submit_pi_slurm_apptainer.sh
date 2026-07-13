@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=webarea-distill-pi-q35-4n
-#SBATCH --account=nemotron_omni_vision
+#SBATCH --account=nvr_lpr_agentic
+#SBATCH --reservation=sla_res_fw190_d580
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
@@ -165,8 +166,8 @@ if [ -z "${job_account}" ]; then
     job_account="$(scontrol show job -o "${SLURM_JOB_ID}" | sed -n 's/.* Account=\([^ ]*\).*/\1/p')"
 fi
 case "${job_account}" in
-    nemotron_omni_vision) ;;
-    *) die "account ${job_account:-unknown} is not allowed; use nemotron_omni_vision" ;;
+    nvr_lpr_agentic) ;;
+    *) die "account ${job_account:-unknown} is not allowed; use nvr_lpr_agentic" ;;
 esac
 [ -x "${script_dir}/run_pi_apptainer_train.sh" ] || die "missing inner launcher"
 [ -f "${train_sqsh}" ] || die "missing training image: ${train_sqsh}"

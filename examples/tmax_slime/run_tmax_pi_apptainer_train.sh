@@ -253,6 +253,9 @@ use_tis="${use_tis:-0}"
 eps_clip="${eps_clip:-0.2}"
 eps_clip_high="${eps_clip_high:-0.28}"
 eps_clip_c="${eps_clip_c:-10.0}"
+dynamic_sampling_filter_path="${dynamic_sampling_filter_path:-}"
+calculate_per_token_loss="${calculate_per_token_loss:-0}"
+grpo_std_normalization="${grpo_std_normalization:-1}"
 
 polar_builder_strategy="${polar_builder_strategy:-prefix_merging}"
 polar_min_complete_accept_fraction="${polar_min_complete_accept_fraction:-0.6}"
@@ -1514,6 +1517,25 @@ PY
         sequence_parallel_args=(--sequence-parallel)
     fi
 
+    local dynamic_sampling_args=()
+    if [ -n "${dynamic_sampling_filter_path}" ]; then
+        dynamic_sampling_args=(--dynamic-sampling-filter-path "${dynamic_sampling_filter_path}")
+    fi
+
+    local per_token_loss_args=()
+    case "${calculate_per_token_loss}" in
+        1|true) per_token_loss_args=(--calculate-per-token-loss) ;;
+        0|false) ;;
+        *) die "calculate_per_token_loss must be 0/1/false/true; got ${calculate_per_token_loss}" ;;
+    esac
+
+    local grpo_normalization_args=()
+    case "${grpo_std_normalization}" in
+        0|false) grpo_normalization_args=(--disable-grpo-std-normalization) ;;
+        1|true) ;;
+        *) die "grpo_std_normalization must be 0/1/false/true; got ${grpo_std_normalization}" ;;
+    esac
+
     local train_args=(
         "${slime_dir}/train_async.py"
         --actor-num-nodes "${actor_num_nodes}"
@@ -1550,6 +1572,7 @@ PY
         --rollout-max-prompt-len "${rollout_max_prompt_len}"
         --save-debug-rollout-data "${run_dir}/debug_rollout_{rollout_id}.pt"
         --dynamic-history
+        "${dynamic_sampling_args[@]}"
         --num-steps-per-rollout "${num_steps_per_rollout}"
         --distributed-timeout-minutes "${distributed_timeout_minutes}"
         --qwen-gdn-backend "${qwen_gdn_backend}"
@@ -1566,6 +1589,8 @@ PY
         --log-probs-chunk-size "${log_probs_chunk_size}"
         --advantage-estimator grpo
         --normalize-advantages
+        "${grpo_normalization_args[@]}"
+        "${per_token_loss_args[@]}"
         "${tis_args[@]}"
         --use-kl-loss
         --kl-loss-coef "${kl_loss_coef}"
@@ -1664,6 +1689,7 @@ if [ -n "${anthropic_max_tokens}" ]; then
 fi
 log "GPU split: total=${total_gpus}, train=${train_num_gpus}, rollout=${rollout_num_gpus}, tp=${tensor_model_parallel_size}"
 log "Batch: rollout=${rollout_batch_size}, samples/prompt=${n_samples_per_prompt}, num_rollout=${num_rollout:-epoch}"
+log "DAPO: dynamic_sampling=${dynamic_sampling_filter_path:-off}, per_token_loss=${calculate_per_token_loss}, grpo_std_normalization=${grpo_std_normalization}, kl_loss_coef=${kl_loss_coef}"
 log "Rollout start: ${start_rollout_id:-checkpoint}"
 log "W&B: entity=${wandb_entity}, project=${wandb_project}, group=${wandb_group}, run_id=${wandb_run_id}"
 
