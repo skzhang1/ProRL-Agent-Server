@@ -1,0 +1,65 @@
+# Polar bridge configuration for Slime TMax rollouts.
+polar_rollout_url: "http://127.0.0.1:8080"
+polar_gateway_url: "http://127.0.0.1:8100"
+polar_reward_key: "score"
+polar_max_async_level: 1
+polar_request_timeout: 1800
+polar_callback_host: "127.0.0.1"
+polar_min_complete_accept_fraction: 0.0
+polar_agent_cli_dir: ${AGENT_CLI_DIR}
+polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
+
+polar_task_template:
+  timeout_seconds: "{sample.metadata.timeout_seconds}"
+  runtime:
+    backend: "apptainer"
+    image: "{sample.metadata.sif_path}"
+    network: "host"
+    allow_internet: "{sample.metadata.allow_internet}"
+    workdir: "{sample.metadata.workdir}"
+    direct_exec_init_command: >-
+      if [ -f /.singularity.d/env/99-rogue.sh ]; then
+        . /.singularity.d/env/99-rogue.sh;
+      fi
+    env:
+      HOME: "/polar/session/home"
+      PATH: "/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    kwargs:
+      volumes:
+        - "{args.polar_agent_cli_dir}:/opt/node:ro"
+    prepare:
+      - type: exec
+        command: >-
+          mkdir -p /polar/session/home /polar/session/logs/agent &&
+          if command -v git >/dev/null 2>&1; then
+            git config --global core.pager '';
+          fi
+  agent:
+    harness: "pi"
+    model_name: "openai/Qwen/Qwen3.5-4B"
+    settings: {}
+  builder:
+    strategy: "prefix_merging"
+  evaluator:
+    strategy: "harbor"
+    refresh_runtime: false
+    config:
+      tests_dir: "{sample.metadata.tests_dir}"
+      # Keep uploads inside the /polar/session bind mount; direct-exec Apptainer
+      # does not create an instance:// target for uploading to /tests directly.
+      tests_target: "/polar/session/tests"
+      verifier_dir: "/polar/session/logs/verifier"
+      test_command: >-
+        rm -rf /tests /logs/verifier &&
+        mkdir -p /logs &&
+        ln -s /polar/session/tests /tests &&
+        ln -s /polar/session/logs/verifier /logs/verifier &&
+        bash /tests/test.sh
+      verifier_timeout: "{sample.metadata.verifier_timeout}"
+
+polar_task_id_template: "polar-tmax-pi-{rollout_id}-{sample.group_index}"

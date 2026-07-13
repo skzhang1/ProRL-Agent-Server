@@ -318,7 +318,7 @@ export sglang_context_length sglang_mem_fraction_static distributed_timeout_minu
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
 export agent_harness agent_label pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
 export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
-export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks
+export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
 export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export rollout_port gateway_port
@@ -345,6 +345,10 @@ rank_is_gateway() {
         *) return 1 ;;
     esac
 }
+ray_log_monitor_args=(--include-log-monitor=false)
+if [ -n "${slime_train_rank:-}" ] && [ "${rank}" = "${slime_train_rank}" ]; then
+    ray_log_monitor_args=()
+fi
 cache_root="/tmp/webarea-pi-${SLURM_JOB_ID}-${rank}"
 export PATH="/opt/polr_venv/bin:/usr/local/cuda/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -421,7 +425,7 @@ if [ "${rank}" = "0" ]; then
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
         --dashboard-host=0.0.0.0 --dashboard-port="${ray_dashboard_port}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
-        --temp-dir="${ray_tmpdir}" --disable-usage-stats \
+        --temp-dir="${ray_tmpdir}" --disable-usage-stats "${ray_log_monitor_args[@]}" \
         >"${run_log_dir}/ray-head.log" 2>&1
 
     finish_workers() {
@@ -445,7 +449,7 @@ raise SystemExit(f"Ray head did not open at {host}:{port}")
 PY
     ray start --address="${ray_head_ip}:${ray_port}" --node-ip-address="${node_ip}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
-        --temp-dir="${ray_tmpdir}" --disable-usage-stats --block \
+        --temp-dir="${ray_tmpdir}" --disable-usage-stats "${ray_log_monitor_args[@]}" --block \
         >"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
     ray_pid="$!"
     if rank_is_gateway; then
