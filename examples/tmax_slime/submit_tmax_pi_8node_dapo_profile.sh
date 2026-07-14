@@ -82,7 +82,7 @@ PY
     export WANDB_API_KEY
 fi
 
-profile_id="${profile_id:-b8_s8_t2_r48_a4_gw128}"
+profile_id="${profile_id:-b8_s16_t5_r48_a4_gw48_timeout480_req1200_mcf05_pi512}"
 run_id="${run_id:-webarea-debug_tmax_pi_8n_dapo_${profile_id}_${SLURM_JOB_ID}}"
 run_label="${run_label:-8n-dapo-${profile_id}}"
 run_dir="${run_dir:-${project_root}/tmp/${run_id}}"
@@ -102,7 +102,9 @@ slurm_node_records=()
 ray_head_ip=""
 for idx in "${!slurm_nodes[@]}"; do
     node="${slurm_nodes[$idx]}"
-    node_ip="$(srun --overlap -N1 -n1 -w "${node}" hostname -I | awk '{print $1}')"
+    # This probe only needs a tiny step; keep it from inheriting the training
+    # job's large CPU/memory request, which can make Slurm reject the step.
+    node_ip="$(srun --overlap --cpus-per-task=1 --mem=1G -N1 -n1 -w "${node}" hostname -I | awk '{print $1}')"
     [ -n "${node_ip}" ] || die "failed to resolve node IP for ${node}"
     slurm_node_records+=("${idx}:${node}:${node_ip}")
     if [ "${idx}" = "0" ]; then
@@ -158,8 +160,8 @@ export tmax_scan_tasks="${tmax_scan_tasks:-14601}"
 export tmax_only_ready="${tmax_only_ready:-1}"
 export smoke_rows="${smoke_rows:-0}"
 export rollout_batch_size="${rollout_batch_size:-8}"
-export n_samples_per_prompt="${n_samples_per_prompt:-8}"
-export num_rollout="${num_rollout:-2}"
+export n_samples_per_prompt="${n_samples_per_prompt:-16}"
+export num_rollout="${num_rollout:-5}"
 export target_num_rollout="${target_num_rollout:-${num_rollout}}"
 export save_interval="${save_interval:-1}"
 export global_batch_size="${global_batch_size:-$((rollout_batch_size * n_samples_per_prompt))}"
@@ -188,15 +190,15 @@ export rollout_max_prompt_len="${rollout_max_prompt_len:-32000}"
 export rollout_max_response_len="${rollout_max_response_len:-4096}"
 export polar_max_async_level="${polar_max_async_level:-4}"
 export polar_min_complete_accept_fraction="${polar_min_complete_accept_fraction:-0.5}"
-export polar_task_timeout_from_metadata="${polar_task_timeout_from_metadata:-1}"
-export polar_request_timeout="${polar_request_timeout:-2400}"
-export polar_task_timeout_seconds="${polar_task_timeout_seconds:-1800}"
+export polar_task_timeout_from_metadata="${polar_task_timeout_from_metadata:-0}"
+export polar_request_timeout="${polar_request_timeout:-1200}"
+export polar_task_timeout_seconds="${polar_task_timeout_seconds:-480}"
 
 export polar_multi_gateway="${polar_multi_gateway:-1}"
 export polar_gateway_count="${polar_gateway_count:-$((num_nodes - train_node_count))}"
-export polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-16}"
-export polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-128}"
-export polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-64}"
+export polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
+export polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-48}"
+export polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-24}"
 positive_int "${polar_max_async_level}" || die "polar_max_async_level must be positive"
 positive_int "${polar_gateway_count}" || die "polar_gateway_count must be positive"
 [ "${polar_gateway_count}" -le "${num_nodes}" ] || die "polar_gateway_count exceeds num_nodes"
@@ -263,6 +265,7 @@ set -euo pipefail
 rank="${SLURM_PROCID}"
 node="$(hostname)"
 node_ip="$(hostname -I | awk '{print $1}')"
+trace_log="${run_log_dir}/worker-rank-${rank}.trace.log"
 cache_root="/tmp/wdt2-${SLURM_JOB_ID}-${rank}"
 export PATH="/opt/polr_venv/bin:/usr/local/cuda/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -284,6 +287,20 @@ mkdir -p "${HOME}" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" "${APPTAINER_WO
     "${XDG_CONFIG_HOME}" "${XDG_RUNTIME_DIR}" "${CUDA_CACHE_PATH}" "${NUMBA_CACHE_DIR}" \
     "${ray_tmpdir}" "${job_cache_root}"
 chmod 700 "${XDG_RUNTIME_DIR}"
+
+trace() {
+    printf '%s rank=%s node=%s pid=%s %s\n' "$(date -u +%FT%TZ)" "${rank}" "${node}" "$$" "$*" >>"${trace_log}" 2>/dev/null || true
+}
+
+stop_file_state() {
+    if [ -f "${stop_file}" ]; then
+        stat -c 'present mtime=%y size=%s' "${stop_file}" 2>/dev/null || printf 'present'
+    else
+        printf 'absent'
+    fi
+}
+
+trace "worker start node_ip=${node_ip} cache_root=${cache_root} stop_file=$(stop_file_state)"
 
 rank_is_gateway() {
     [ "${polar_multi_gateway}" = "1" ] || return 1
@@ -314,27 +331,27 @@ patch_container_runtime_only=1 bash "${script_dir}/run_tmax_pi_apptainer_train.s
 
 cleanup_stale_sglang_processes() {
     if [ "${cleanup_stale_sglang}" != "1" ]; then
-        echo "cleanup_stale_sglang=${cleanup_stale_sglang}; skipping stale SGLang cleanup on ${node}"
+        echo "cleanup_stale_sglang=${cleanup_stale_sglang}; skipping stale runtime cleanup on ${node}"
         return
     fi
     if ! command -v pgrep >/dev/null 2>&1; then
-        echo "pgrep not available; skipping stale SGLang cleanup on ${node}"
+        echo "pgrep not available; skipping stale runtime cleanup on ${node}"
         return
     fi
     local user_id pattern pids
     user_id="$(id -u)"
-    pattern='SGLangEngine|sglang_router|sglang[.]srt|sglang[.]launch'
+    pattern='SGLangEngine|sglang_router|sglang[.]srt|sglang[.]launch|raylet|gcs_server|ray::|ray-dashboard|log_monitor|train_async[.]py|polar serve_(rollout|gateway)|run_tmax_pi_apptainer_train[.]sh|wandb-core|wandb-xpu|squashfuse_ll|fuse-overlayfs'
     pids="$(pgrep -u "${user_id}" -f "${pattern}" || true)"
     if [ -z "${pids}" ]; then
-        echo "No stale SGLang/router processes found on ${node}"
+        echo "No stale Ray/Polar/SGLang runtime processes found on ${node}"
         return
     fi
-    echo "Stopping stale SGLang/router processes on ${node}: $(printf '%s' "${pids}" | tr '\n' ' ')"
+    echo "Stopping stale Ray/Polar/SGLang runtime processes on ${node}: $(printf '%s' "${pids}" | tr '\n' ' ')"
     kill ${pids} >/dev/null 2>&1 || true
     sleep 2
     pids="$(pgrep -u "${user_id}" -f "${pattern}" || true)"
     if [ -n "${pids}" ]; then
-        echo "Force-stopping stale SGLang/router processes on ${node}: $(printf '%s' "${pids}" | tr '\n' ' ')"
+        echo "Force-stopping stale Ray/Polar/SGLang runtime processes on ${node}: $(printf '%s' "${pids}" | tr '\n' ' ')"
         kill -9 ${pids} >/dev/null 2>&1 || true
     fi
 }
@@ -342,10 +359,69 @@ cleanup_stale_sglang_processes() {
 cleanup_stale_sglang_processes >"${run_log_dir}/stale-sglang-cleanup-rank-${rank}.log" 2>&1
 ray stop --force >/dev/null 2>&1 || true
 monitor_pid=""
+resource_monitor_pid=""
 ray_pid=""
 gateway_pid=""
+dump_cgroup_memory() {
+    local cg path f
+    cg="$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)"
+    [ -n "${cg}" ] || cg="/"
+    path="/sys/fs/cgroup${cg}"
+    printf 'cgroup=%s path=%s\n' "${cg}" "${path}"
+    if [ -d "${path}" ]; then
+        for f in memory.current memory.peak memory.max memory.high memory.events memory.swap.current memory.swap.max; do
+            if [ -f "${path}/${f}" ]; then
+                printf '%s=' "${f}"
+                cat "${path}/${f}" 2>/dev/null || true
+            fi
+        done
+    fi
+}
+resource_snapshot() {
+    printf '===== %s node=%s rank=%s stop_file=%s =====\n' "$(date -u +%FT%TZ)" "${node}" "${rank}" "$(stop_file_state)"
+    dump_cgroup_memory
+    free -m 2>/dev/null || true
+    df -h /tmp "${cache_root}" 2>/dev/null || true
+    ps -u "$(id -u)" -o pid,ppid,stat,comm,rss,vsz,etime,args --sort=-rss 2>/dev/null \
+        | awk 'NR == 1 {print; next} /raylet|log_monitor|SGLangEngine|sglang|python|uvicorn|polar|apptainer|codex/ {print; count++; if (count >= 80) exit}'
+}
+archive_ray_local_logs() {
+    local dst files f rel
+    dst="${run_log_dir}/ray-local-rank-${rank}"
+    files="${dst}/files.txt"
+    mkdir -p "${dst}"
+    {
+        printf 'timestamp=%s\n' "$(date -u +%FT%TZ)"
+        printf 'node=%s\nrank=%s\nnode_ip=%s\nray_tmpdir=%s\n' "${node}" "${rank}" "${node_ip}" "${ray_tmpdir}"
+    } >"${dst}/manifest.txt"
+    if [ ! -d "${ray_tmpdir}" ]; then
+        printf 'missing ray_tmpdir\n' >>"${dst}/manifest.txt"
+        return
+    fi
+    find "${ray_tmpdir}" -maxdepth 4 -type f \
+        \( -name 'ray_process_exit.log' \
+           -o -name 'raylet.err' \
+           -o -name 'raylet.out' \
+           -o -name 'gcs_server.err' \
+           -o -name 'gcs_server.out' \
+           -o -name 'dashboard_agent.log' \
+           -o -name 'runtime_env_agent.log' \
+           -o -name 'worker-*.err' \) \
+        -print >"${files}" 2>/dev/null || true
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        rel="${f#${ray_tmpdir}/}"
+        mkdir -p "${dst}/$(dirname "${rel}")"
+        cp -p "${f}" "${dst}/${rel}" 2>/dev/null || true
+    done <"${files}"
+}
 cleanup() {
+    local cleanup_rc="$?"
+    trace "cleanup enter rc=${cleanup_rc} monitor_pid=${monitor_pid:-} ray_pid=${ray_pid:-} gateway_pid=${gateway_pid:-} stop_file=$(stop_file_state)"
+    resource_snapshot >>"${run_log_dir}/resource-rank-${rank}.log" 2>&1 || true
+    archive_ray_local_logs || true
     [ -z "${monitor_pid}" ] || kill "${monitor_pid}" 2>/dev/null || true
+    [ -z "${resource_monitor_pid}" ] || kill "${resource_monitor_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || kill "${gateway_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || wait "${gateway_pid}" 2>/dev/null || true
     if [ -n "${ray_pid}" ]; then
@@ -353,8 +429,11 @@ cleanup() {
         wait "${ray_pid}" 2>/dev/null || true
     fi
     ray stop --force >/dev/null 2>&1 || true
+    trace "cleanup done rc=${cleanup_rc} stop_file=$(stop_file_state)"
 }
 trap cleanup EXIT
+trap 'trace "signal SIGTERM received stop_file=$(stop_file_state)"; exit 143' TERM
+trap 'trace "signal SIGINT received stop_file=$(stop_file_state)"; exit 130' INT
 
 (
     while true; do
@@ -366,7 +445,16 @@ trap cleanup EXIT
 ) >>"${run_log_dir}/gpu-rank-${rank}.csv" 2>&1 &
 monitor_pid="$!"
 
+(
+    while true; do
+        resource_snapshot
+        sleep 15
+    done
+) >>"${run_log_dir}/resource-rank-${rank}.log" 2>&1 &
+resource_monitor_pid="$!"
+
 if [ "${rank}" = "0" ]; then
+    trace "starting ray head ${ray_head_ip}:${ray_port}"
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
         --dashboard-host=0.0.0.0 --dashboard-port="${ray_dashboard_port}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
@@ -374,12 +462,19 @@ if [ "${rank}" = "0" ]; then
         >"${run_log_dir}/ray-head.log" 2>&1
 
     finish_workers() {
+        trace "touch stop_file"
         touch "${stop_file}"
     }
     trap 'finish_workers; cleanup' EXIT
 
+    trace "starting train driver"
+    set +e
     ray_use_existing_cluster=1 ray_stop_on_exit=0 \
         bash "${script_dir}/run_tmax_pi_apptainer_train.sh"
+    train_rc="$?"
+    set -e
+    trace "train driver exited rc=${train_rc}"
+    exit "${train_rc}"
 else
     python - "${ray_head_ip}" "${ray_port}" <<'PY'
 import socket
@@ -400,19 +495,36 @@ PY
         --temp-dir="${ray_tmpdir}" --disable-usage-stats --block \
         >"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
     ray_pid="$!"
+    trace "started ray worker pid=${ray_pid}"
     if rank_is_gateway; then
         RAY_NODE_RANK="${rank}" pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
             bash "${script_dir}/run_tmax_pi_apptainer_train.sh" \
             >"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
         gateway_pid="$!"
+        trace "started gateway sidecar pid=${gateway_pid}"
     fi
     while [ ! -f "${stop_file}" ]; do
-        kill -0 "${ray_pid}" 2>/dev/null || { wait "${ray_pid}"; exit $?; }
+        if ! kill -0 "${ray_pid}" 2>/dev/null; then
+            set +e
+            wait "${ray_pid}"
+            child_rc="$?"
+            set -e
+            trace "ray worker pid=${ray_pid} exited rc=${child_rc} stop_file=$(stop_file_state)"
+            exit "${child_rc}"
+        fi
         if [ -n "${gateway_pid}" ]; then
-            kill -0 "${gateway_pid}" 2>/dev/null || { wait "${gateway_pid}"; exit $?; }
+            if ! kill -0 "${gateway_pid}" 2>/dev/null; then
+                set +e
+                wait "${gateway_pid}"
+                child_rc="$?"
+                set -e
+                trace "gateway sidecar pid=${gateway_pid} exited rc=${child_rc} stop_file=$(stop_file_state)"
+                exit "${child_rc}"
+            fi
         fi
         sleep 5
     done
+    trace "stop_file observed; worker exiting normally stop_file=$(stop_file_state)"
 fi
 WORKER
 chmod +x "${worker_script}"
