@@ -10,6 +10,17 @@
 #SBATCH --time=4:00:00
 #SBATCH --exclusive
 #SBATCH --mem=0
+# Same-name resubmissions run serially and auto-resume from the latest
+# checkpoint, so an externally cancelled job (e.g. the cluster's idle-GPU
+# reaper) only loses the step in progress.
+#SBATCH --dependency=singleton
+# pool1-00187 externally SIGKILLs Ray processes ~20 min into every job that
+# lands on it (jobs 5229386, 5229849, 5230998, 5243843); no OOM, no error.
+# pool1-00120's SGLang engines stop answering mid-run (jobs 5229658, 5243844),
+# and engine recreation on the sick node hangs update_weights until the idle
+# reaper kills the job.
+# pool1-00202: raylet SIGKILL at 21 min (5243847), same class as 00187.
+#SBATCH --exclude=pool1-[00001-00224],pool1-00266,pool0-[00126,04476,04843,04892,04982,05158,05432],pool0-[05800-05984]
 #SBATCH --output=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/logs/slurm/%x-%j.out
 #SBATCH --error=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/logs/slurm/%x-%j.err
 #SBATCH --export=ALL
@@ -82,11 +93,17 @@ PY
     export WANDB_API_KEY
 fi
 
-profile_id="${profile_id:-b8_s16_t5_r48_a4_gw48_timeout480_req1200_mcf05_pi512}"
-run_id="${run_id:-webarea-debug_tmax_pi_8n_dapo_${profile_id}_${SLURM_JOB_ID}}"
+# Defaults reproduce the first fully successful 5-step run (job 5249486,
+# 2026-07-15, ~19 min/step): 1 train node (TP4/DP2, 8 train + 56 rollout GPUs),
+# gateway workers 24/96/48, SGLang cuda_graph_max_bs=32. Change profile_id to
+# start a fresh lineage; identical profile_id resumes its checkpoints.
+profile_id="${profile_id:-b8_s16_a4_tn1_gw96_cg32_t480_mcf05}"
+# The run identity is intentionally job-id-free: chained singleton jobs share
+# the same checkpoints, prompt data, and W&B run, and resume automatically.
+run_id="${run_id:-webarea-debug_tmax_pi_8n_dapo_${profile_id}}"
 run_label="${run_label:-8n-dapo-${profile_id}}"
 run_dir="${run_dir:-${project_root}/tmp/${run_id}}"
-run_log_dir="${run_log_dir:-${run_dir}/logs}"
+run_log_dir="${run_log_dir:-${run_dir}/logs/job-${SLURM_JOB_ID}}"
 rollout_save_dir="${rollout_save_dir:-${run_dir}/rollout_results}"
 save_dir="${save_dir:-${project_root}/tmp/ckpt/${run_id}}"
 mkdir -p "${run_dir}" "${run_log_dir}" "${rollout_save_dir}" "${save_dir}"
@@ -135,7 +152,7 @@ export run_id run_label run_dir run_log_dir rollout_save_dir save_dir stop_file
 export num_nodes="${nodes}"
 export gpus_per_node="${gpus_per_node:-8}"
 export total_gpus="$((num_nodes * gpus_per_node))"
-export train_node_count="${train_node_count:-2}"
+export train_node_count="${train_node_count:-1}"
 export train_num_gpus="${train_num_gpus:-$((train_node_count * gpus_per_node))}"
 export actor_num_nodes="${actor_num_nodes:-${train_node_count}}"
 export actor_num_gpus_per_node="${actor_num_gpus_per_node:-8}"
@@ -146,6 +163,15 @@ export ray_head_num_gpus="${ray_head_num_gpus:-${gpus_per_node}}"
 export ray_expected_num_gpus="${ray_expected_num_gpus:-${total_gpus}}"
 export ray_cluster_timeout_seconds="${ray_cluster_timeout_seconds:-900}"
 export ray_num_cpus="${ray_num_cpus:-128}"
+# Raylet reads this at `ray start`; the inner trainer sets it too late to
+# affect the host-memory monitor. 0.99 avoids false SIGKILLs of SGLang
+# actors from CUDA/page-cache memory accounting on rollout nodes.
+export ray_memory_usage_threshold="${ray_memory_usage_threshold:-0.99}"
+# Bound collective hangs: a dead SGLang engine inside the update_weights
+# broadcast (seen in 5243844) otherwise blocks for the Megatron default 180
+# minutes and the job dies to the idle reaper instead of failing fast and
+# letting the singleton chain resume from the checkpoint.
+export distributed_timeout_minutes="${distributed_timeout_minutes:-15}"
 
 positive_int "${train_node_count}" || die "train_node_count must be a positive integer"
 positive_int "${train_num_gpus}" || die "train_num_gpus must be a positive integer"
@@ -174,6 +200,27 @@ positive_int "${global_batch_size}" || die "global_batch_size must be positive"
 [ "${global_batch_size}" -eq "$((rollout_batch_size * n_samples_per_prompt))" ] || \
     die "global_batch_size must equal rollout_batch_size*n_samples_per_prompt"
 
+# Singleton auto-resume: Slime writes checkpoint iteration N only after
+# rollout N has trained, so completed rollouts = N + 1. A fresh save
+# directory starts at rollout zero; a finished run exits immediately.
+start_rollout_id="${start_rollout_id:-}"
+if [ -z "${start_rollout_id}" ]; then
+    completed_rollouts=0
+    latest_file="${save_dir}/latest_checkpointed_iteration.txt"
+    if [ -s "${latest_file}" ]; then
+        latest_iteration="$(tr -d '[:space:]' <"${latest_file}")"
+        nonnegative_int "${latest_iteration}" || die "invalid checkpoint iteration in ${latest_file}: ${latest_iteration}"
+        completed_rollouts=$((latest_iteration + 1))
+    fi
+    if [ "${completed_rollouts}" -ge "${target_num_rollout}" ]; then
+        printf 'Training already complete: %s/%s rollouts in %s\n' \
+            "${completed_rollouts}" "${target_num_rollout}" "${save_dir}"
+        exit 0
+    fi
+    start_rollout_id="${completed_rollouts}"
+fi
+export start_rollout_id
+
 export qwen_gdn_backend=fla
 export attention_backend="${attention_backend:-flash}"
 export pi_fail_on_context_limit="${pi_fail_on_context_limit:-0}"
@@ -183,7 +230,7 @@ export fetch_trajectory_retry_times="${fetch_trajectory_retry_times:-3}"
 export max_tokens_per_gpu="${max_tokens_per_gpu:-50000}"
 export sglang_context_length="${sglang_context_length:-50000}"
 export sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.7}"
-export sglang_cuda_graph_max_bs="${sglang_cuda_graph_max_bs:-}"
+export sglang_cuda_graph_max_bs="${sglang_cuda_graph_max_bs:-32}"
 export sglang_disable_custom_all_reduce="${sglang_disable_custom_all_reduce:-0}"
 export sglang_disable_cuda_graph="${sglang_disable_cuda_graph:-0}"
 export rollout_max_prompt_len="${rollout_max_prompt_len:-32000}"
@@ -197,8 +244,10 @@ export polar_task_timeout_seconds="${polar_task_timeout_seconds:-480}"
 export polar_multi_gateway="${polar_multi_gateway:-1}"
 export polar_gateway_count="${polar_gateway_count:-$((num_nodes - train_node_count))}"
 export polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
-export polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-48}"
-export polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-24}"
+export polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-96}"
+export polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-48}"
+export polar_gateway_max_restarts="${polar_gateway_max_restarts:-20}"
+export ray_worker_max_restarts="${ray_worker_max_restarts:-3}"
 positive_int "${polar_max_async_level}" || die "polar_max_async_level must be positive"
 positive_int "${polar_gateway_count}" || die "polar_gateway_count must be positive"
 [ "${polar_gateway_count}" -le "${num_nodes}" ] || die "polar_gateway_count exceeds num_nodes"
@@ -282,6 +331,10 @@ export CUDA_CACHE_PATH="${cache_root}/cuda-cache"
 export NUMBA_CACHE_DIR="${cache_root}/numba"
 export ray_tmpdir="${cache_root}/ray"
 export job_cache_root="${cache_root}/job"
+# Must be visible to `ray start` below; the inner trainer exports it too
+# late to affect raylet's host-memory monitor (false kills otherwise).
+export RAY_MEMORY_USAGE_THRESHOLD="${ray_memory_usage_threshold:-0.99}"
+export RAY_memory_usage_threshold="${RAY_MEMORY_USAGE_THRESHOLD}"
 mkdir -p "${HOME}" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}" "${APPTAINER_WORKDIR}" \
     "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${XDG_CACHE_HOME}" \
     "${XDG_CONFIG_HOME}" "${XDG_RUNTIME_DIR}" "${CUDA_CACHE_PATH}" "${NUMBA_CACHE_DIR}" \
@@ -419,6 +472,9 @@ cleanup() {
     local cleanup_rc="$?"
     trace "cleanup enter rc=${cleanup_rc} monitor_pid=${monitor_pid:-} ray_pid=${ray_pid:-} gateway_pid=${gateway_pid:-} stop_file=$(stop_file_state)"
     resource_snapshot >>"${run_log_dir}/resource-rank-${rank}.log" 2>&1 || true
+    # Kernel-side evidence for the external SIGKILL class: an OOM or kernel
+    # kill shows up here; silence implicates a userspace agent instead.
+    dmesg -T 2>/dev/null | tail -120 >"${run_log_dir}/dmesg-rank-${rank}.log" || true
     archive_ray_local_logs || true
     [ -z "${monitor_pid}" ] || kill "${monitor_pid}" 2>/dev/null || true
     [ -z "${resource_monitor_pid}" ] || kill "${resource_monitor_pid}" 2>/dev/null || true
@@ -490,18 +546,36 @@ for _ in range(450):
         time.sleep(2)
 raise SystemExit(f"Ray head did not open at {host}:{port}")
 PY
-    ray start --address="${ray_head_ip}:${ray_port}" --node-ip-address="${node_ip}" \
-        --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
-        --temp-dir="${ray_tmpdir}" --disable-usage-stats --block \
-        >"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
-    ray_pid="$!"
-    trace "started ray worker pid=${ray_pid}"
-    if rank_is_gateway; then
+    # Ray's log monitor tails every worker/SGLang log on the node and has
+    # repeatedly been the first process SIGKILLed on rollout ranks; its death
+    # makes `ray start --block` exit and takes the whole job down. Disable it
+    # off the head node; all logs remain on disk and in run_log_dir archives.
+    #
+    # Something node-local also SIGKILLs `ray start --block` itself on one
+    # rollout rank in most runs (5243843/44/47, 5244304/05, on five different
+    # nodes). Restart the Ray worker in place: the node re-registers with the
+    # head and Slime's rollout fault tolerance recreates the lost engines.
+    ray_worker_restarts=0
+    start_ray_worker_bg() {
+        ray start --address="${ray_head_ip}:${ray_port}" --node-ip-address="${node_ip}" \
+            --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
+            --temp-dir="${ray_tmpdir}" --disable-usage-stats \
+            --include-log-monitor=false --block \
+            >>"${run_log_dir}/ray-worker-${rank}.log" 2>&1 &
+        ray_pid="$!"
+        trace "started ray worker pid=${ray_pid} restart=${ray_worker_restarts}"
+    }
+    start_ray_worker_bg
+    gateway_restarts=0
+    start_gateway_sidecar_bg() {
         RAY_NODE_RANK="${rank}" pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
             bash "${script_dir}/run_tmax_pi_apptainer_train.sh" \
-            >"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
+            >>"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
         gateway_pid="$!"
-        trace "started gateway sidecar pid=${gateway_pid}"
+        trace "started gateway sidecar pid=${gateway_pid} restart=${gateway_restarts}"
+    }
+    if rank_is_gateway; then
+        start_gateway_sidecar_bg
     fi
     while [ ! -f "${stop_file}" ]; do
         if ! kill -0 "${ray_pid}" 2>/dev/null; then
@@ -509,8 +583,15 @@ PY
             wait "${ray_pid}"
             child_rc="$?"
             set -e
-            trace "ray worker pid=${ray_pid} exited rc=${child_rc} stop_file=$(stop_file_state)"
-            exit "${child_rc}"
+            trace "ray worker pid=${ray_pid} exited rc=${child_rc} restart=${ray_worker_restarts} stop_file=$(stop_file_state)"
+            ray_worker_restarts=$((ray_worker_restarts + 1))
+            if [ "${ray_worker_restarts}" -gt "${ray_worker_max_restarts}" ]; then
+                trace "ray worker exceeded restart limit ${ray_worker_max_restarts}"
+                exit "${child_rc}"
+            fi
+            ray stop --force >/dev/null 2>&1 || true
+            sleep 5
+            start_ray_worker_bg
         fi
         if [ -n "${gateway_pid}" ]; then
             if ! kill -0 "${gateway_pid}" 2>/dev/null; then
@@ -518,8 +599,14 @@ PY
                 wait "${gateway_pid}"
                 child_rc="$?"
                 set -e
-                trace "gateway sidecar pid=${gateway_pid} exited rc=${child_rc} stop_file=$(stop_file_state)"
-                exit "${child_rc}"
+                trace "gateway sidecar pid=${gateway_pid} exited rc=${child_rc} restart=${gateway_restarts} stop_file=$(stop_file_state)"
+                gateway_restarts=$((gateway_restarts + 1))
+                if [ "${gateway_restarts}" -gt "${polar_gateway_max_restarts}" ]; then
+                    trace "gateway sidecar exceeded restart limit ${polar_gateway_max_restarts}"
+                    exit "${child_rc}"
+                fi
+                sleep 5
+                start_gateway_sidecar_bg
             fi
         fi
         sleep 5
@@ -549,7 +636,8 @@ webarea TMax PI 8-node DAPO profile
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
   async:     max_async=${polar_max_async_level}, min_complete_accept_fraction=${polar_min_complete_accept_fraction}
   data:      tmax_scan_tasks=${tmax_scan_tasks}, smoke_rows=${smoke_rows}
-  boundary:  ${num_rollout}/${target_num_rollout}
+  boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id})
+  resilience: ray_mem_threshold=${ray_memory_usage_threshold}, gateway_restarts<=${polar_gateway_max_restarts}, fault_tolerance=${use_fault_tolerance:-1}
   caps:      max_tokens_per_gpu=${max_tokens_per_gpu}, sglang_context=${sglang_context_length}, response=${rollout_max_response_len}, pi_tokens=${pi_max_tokens}
   sglang:    mem_fraction=${sglang_mem_fraction_static}, router_port=${sglang_router_port}, worker_base_port=${slime_sglang_base_port}, cuda_graph_max_bs=${sglang_cuda_graph_max_bs:-default}, disable_custom_all_reduce=${sglang_disable_custom_all_reduce}, disable_cuda_graph=${sglang_disable_cuda_graph}
   DAPO:      dynamic_sampling=${dynamic_sampling_filter_path}, per_token=${calculate_per_token_loss}, std_norm=${grpo_std_normalization}, KL=${kl_loss_coef}

@@ -260,6 +260,13 @@ dynamic_sampling_filter_path="${dynamic_sampling_filter_path:-}"
 calculate_per_token_loss="${calculate_per_token_loss:-0}"
 grpo_std_normalization="${grpo_std_normalization:-1}"
 
+# Let Slime detect and recreate a rollout SGLang server whose HTTP process
+# dies while the Ray actor remains alive, instead of failing the whole job.
+use_fault_tolerance="${use_fault_tolerance:-1}"
+rollout_health_check_interval="${rollout_health_check_interval:-30}"
+rollout_health_check_timeout="${rollout_health_check_timeout:-30}"
+rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
+
 polar_builder_strategy="${polar_builder_strategy:-prefix_merging}"
 polar_min_complete_accept_fraction="${polar_min_complete_accept_fraction:-0.6}"
 polar_multi_gateway="${polar_multi_gateway:-0}"
@@ -928,6 +935,28 @@ prepare_agent_cli() {
         log "Agent CLI exists: ${agent_cli_dir}"
         return
     fi
+    # Concurrent jobs share this directory; without serialization two fresh
+    # jobs rebuild it simultaneously and corrupt each other (rmtree vs npm).
+    mkdir -p "$(dirname "${agent_cli_dir}")"
+    if command -v flock >/dev/null 2>&1; then
+        local rc=0
+        (
+            flock -w 1800 9 || exit 97
+            if [ "${force_agent_cli}" != "1" ] && [ -x "${agent_cli_dir}/bin/pi" ] && [ -x "${agent_cli_dir}/bin/node" ]; then
+                log "Agent CLI built by a concurrent job: ${agent_cli_dir}"
+                exit 0
+            fi
+            prepare_agent_cli_build
+        ) 9>"${agent_cli_dir}.lock" || rc="$?"
+        [ "${rc}" != "97" ] || die "timed out waiting for agent CLI bootstrap lock: ${agent_cli_dir}.lock"
+        [ "${rc}" = "0" ] || die "agent CLI bootstrap failed with rc=${rc}"
+    else
+        log "flock unavailable; building agent CLI without cross-job lock"
+        prepare_agent_cli_build
+    fi
+}
+
+prepare_agent_cli_build() {
     log "Preparing PI/agent CLI in current project: ${agent_cli_dir}"
     "${python_bin}" - "${script_dir}" "${agent_cli_dir}" "${force_agent_cli}" <<'PY'
 from pathlib import Path
@@ -1716,6 +1745,14 @@ PY
     if [ -n "${fetch_trajectory_retry_times:-}" ]; then
         train_args+=(--fetch-trajectory-retry-times "${fetch_trajectory_retry_times}")
     fi
+    if [ "${use_fault_tolerance}" = "1" ]; then
+        train_args+=(
+            --use-fault-tolerance
+            --rollout-health-check-interval "${rollout_health_check_interval}"
+            --rollout-health-check-timeout "${rollout_health_check_timeout}"
+            --rollout-health-check-first-wait "${rollout_health_check_first_wait}"
+        )
+    fi
 
     log "Launching Slime train_async.py"
     set +e
@@ -1767,6 +1804,7 @@ fi
 log "GPU split: total=${total_gpus}, train=${train_num_gpus}, rollout=${rollout_num_gpus}, tp=${tensor_model_parallel_size}"
 log "Batch: rollout=${rollout_batch_size}, samples/prompt=${n_samples_per_prompt}, num_rollout=${num_rollout:-epoch}"
 log "SGLang: mem_fraction=${sglang_mem_fraction_static}, cuda_graph_max_bs=${sglang_cuda_graph_max_bs:-default}, disable_custom_all_reduce=${sglang_disable_custom_all_reduce}, disable_cuda_graph=${sglang_disable_cuda_graph}"
+log "Rollout fault tolerance: ${use_fault_tolerance} (interval=${rollout_health_check_interval}s, timeout=${rollout_health_check_timeout}s, first_wait=${rollout_health_check_first_wait}s)"
 log "DAPO: dynamic_sampling=${dynamic_sampling_filter_path:-off}, per_token_loss=${calculate_per_token_loss}, grpo_std_normalization=${grpo_std_normalization}, kl_loss_coef=${kl_loss_coef}"
 log "Rollout start: ${start_rollout_id:-checkpoint}"
 log "W&B: entity=${wandb_entity}, project=${wandb_project}, group=${wandb_group}, run_id=${wandb_run_id}"
@@ -1781,11 +1819,37 @@ if [ "${pi_multigw_sidecar:-0}" = "1" ]; then
     exit 0
 fi
 
+# Concurrent jobs (parallel experiment lines) share tmp/ assets: dep
+# checkouts, runtime patches, the agent CLI tree, SIF links, and the seed
+# checkpoint. Serialize preparation with an atomic mkdir lock; flock is not
+# reliable across Lustre clients. A crashed holder goes stale after 30 min.
+prepare_lock_dir="${project_root}/tmp/.tmax_prepare.lock.d"
+prepare_lock_waited=0
+while ! mkdir "${prepare_lock_dir}" 2>/dev/null; do
+    prepare_lock_age=$(( $(date +%s) - $(stat -c %Y "${prepare_lock_dir}" 2>/dev/null || echo 0) ))
+    if [ "${prepare_lock_age}" -gt 1800 ]; then
+        log "Removing stale shared-prepare lock (age ${prepare_lock_age}s): ${prepare_lock_dir}"
+        rmdir "${prepare_lock_dir}" 2>/dev/null || true
+        continue
+    fi
+    [ "${prepare_lock_waited}" -lt 3600 ] || die "timed out waiting for shared-prepare lock: ${prepare_lock_dir}"
+    if [ $((prepare_lock_waited % 60)) -eq 0 ]; then
+        log "Waiting for shared-prepare lock held by another job (${prepare_lock_waited}s): ${prepare_lock_dir}"
+    fi
+    sleep 10
+    prepare_lock_waited=$((prepare_lock_waited + 10))
+done
+trap 'rmdir "${prepare_lock_dir}" 2>/dev/null || true' EXIT
+
 ensure_current_checkouts
 patch_runtime
 prepare_prompt_data_and_sifs
 prepare_agent_cli
 ensure_checkpoint
+
+trap - EXIT
+rmdir "${prepare_lock_dir}" 2>/dev/null || true
+
 render_runtime_configs
 preflight
 
