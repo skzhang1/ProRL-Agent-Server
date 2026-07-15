@@ -60,10 +60,6 @@ nonnegative_int() {
 
 nodes="${nodes:-8}"
 [ "${SLURM_JOB_NUM_NODES:-0}" = "${nodes}" ] || die "this script requires exactly ${nodes} allocated nodes"
-case "${SLURM_JOB_NAME:-}" in
-    webarea-debug*) ;;
-    *) die "job name must start with webarea-debug, got ${SLURM_JOB_NAME:-unknown}" ;;
-esac
 [ -x "${script_dir}/run_tmax_pi_apptainer_train.sh" ] || die "missing inner launcher: ${script_dir}/run_tmax_pi_apptainer_train.sh"
 [ -f "${train_sqsh}" ] || die "missing training image: ${train_sqsh}"
 [ -d "${tmax_dataset_dir}" ] || die "missing TMax dataset dir: ${tmax_dataset_dir}"
