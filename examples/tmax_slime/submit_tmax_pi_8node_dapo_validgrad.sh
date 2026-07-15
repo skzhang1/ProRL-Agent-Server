@@ -183,8 +183,17 @@ export tmax_only_ready="${tmax_only_ready:-1}"
 export smoke_rows="${smoke_rows:-0}"
 export rollout_batch_size="${rollout_batch_size:-8}"
 export n_samples_per_prompt="${n_samples_per_prompt:-16}"
-export num_rollout="${num_rollout:-5}"
-export target_num_rollout="${target_num_rollout:-${num_rollout}}"
+# Single global boundary. Each job resumes from the latest checkpoint and
+# trains toward this rollout count: it exits cleanly when the target is
+# reached, or gets cut by walltime and the next singleton job continues.
+# No per-job step budget is needed. (num_rollout is accepted as a legacy
+# alias and forced equal internally for the inner launcher.)
+export target_num_rollout="${target_num_rollout:-${num_rollout:-5}}"
+export num_rollout="${target_num_rollout}"
+# Ask Slime to stop at a rollout boundary once this many minutes have passed
+# since initialization, leaving headroom inside the 4h walltime for the final
+# synchronous checkpoint instead of losing the in-flight step to SIGTERM.
+export exit_duration_minutes="${exit_duration_minutes:-210}"
 export save_interval="${save_interval:-1}"
 export global_batch_size="${global_batch_size:-$((rollout_batch_size * n_samples_per_prompt))}"
 positive_int "${tmax_scan_tasks}" || die "tmax_scan_tasks must be positive"
@@ -632,7 +641,7 @@ webarea TMax PI 8-node DAPO profile
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
   async:     max_async=${polar_max_async_level}, min_complete_accept_fraction=${polar_min_complete_accept_fraction}
   data:      tmax_scan_tasks=${tmax_scan_tasks}, smoke_rows=${smoke_rows}
-  boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id})
+  boundary:  target=${target_num_rollout} (start=${start_rollout_id}), graceful_exit=${exit_duration_minutes}min
   resilience: ray_mem_threshold=${ray_memory_usage_threshold}, gateway_restarts<=${polar_gateway_max_restarts}, fault_tolerance=${use_fault_tolerance:-1}
   caps:      max_tokens_per_gpu=${max_tokens_per_gpu}, sglang_context=${sglang_context_length}, response=${rollout_max_response_len}, pi_tokens=${pi_max_tokens}
   sglang:    mem_fraction=${sglang_mem_fraction_static}, router_port=${sglang_router_port}, worker_base_port=${slime_sglang_base_port}, cuda_graph_max_bs=${sglang_cuda_graph_max_bs:-default}, disable_custom_all_reduce=${sglang_disable_custom_all_reduce}, disable_cuda_graph=${sglang_disable_cuda_graph}
