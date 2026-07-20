@@ -25,6 +25,7 @@ class PiHarness(BaseHarness):
     """
 
     _AGENT_DIR = "$HOME/.pi/agent"
+    _INSTRUCTION_FILE = "/polar/session/pi-instruction.txt"
 
     async def setup(self, runtime: BaseRuntime) -> None:
         await runtime.exec(f"mkdir -p {self._AGENT_DIR}")
@@ -78,9 +79,19 @@ class PiHarness(BaseHarness):
             flags.append(f"--thinking {shlex.quote(str(thinking))}")
         flags_str = (" " + " ".join(flags)) if flags else ""
 
-        escaped = shlex.quote(instruction)
+        instruction_file = shlex.quote(self._INSTRUCTION_FILE)
 
         return [
+            # Keep the task text out of the long-lived wrapper command line.
+            # Broad agent cleanup such as ``pkill -f <task filename>`` can
+            # otherwise match and SIGKILL that wrapper because it embeds the
+            # full instruction. This short step finishes before pi can run any
+            # task-generated commands.
+            ExecInput(
+                command=(
+                    f"printf '%s' {shlex.quote(instruction)} > {instruction_file}"
+                ),
+            ),
             ExecInput(
                 command=(
                     f"mkdir -p {self._AGENT_DIR} && "
@@ -93,9 +104,9 @@ class PiHarness(BaseHarness):
                     f"--provider {shlex.quote(provider)} "
                     f"--model {shlex.quote(model_id)}"
                     f"{flags_str} "
-                    f"{escaped} "
+                    f'"$(cat {instruction_file})" '
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/pi.txt"
                 ),
                 env={**self.env, "PI_OFFLINE": "1"},
-            )
+            ),
         ]

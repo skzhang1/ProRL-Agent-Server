@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from contextlib import suppress
 from pathlib import Path
@@ -331,7 +332,7 @@ class GatewayNodeManager:
             managed.agent_result = agent_result
 
         except GatewayExecutionTimeout as exc:
-            # Don't set final_result — let _handle_postrun build a partial
+            # Don't set final_result  let _handle_postrun build a partial
             # trajectory from the completions captured so far.
             managed.agent_result = AgentRunResult(
                 status="timeout", return_code=-1, error=str(exc),
@@ -954,12 +955,18 @@ class GatewayNodeManager:
                 session_id,
                 exc_info=True,
             )
-
     async def _remove_session_dir_best_effort(
         self,
         session_dir: Path,
         session_id: str,
     ) -> None:
+        if os.environ.get("POLAR_PRESERVE_FAILED_SESSIONS") == "1":
+            logger.warning(
+                "Preserving gateway session directory %s for session %s",
+                session_dir,
+                session_id,
+            )
+            return
         try:
             await asyncio.to_thread(shutil.rmtree, session_dir)
         except FileNotFoundError:

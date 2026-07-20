@@ -25,6 +25,7 @@ class PolarSlimeConfig:
     max_session_concurrency: int
     max_async_level: int
     max_off_policy_steps: int
+    max_replacement_groups: int
     request_timeout: float | None
     callback_host: str
     scoring_mode: str
@@ -70,6 +71,11 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     max_concurrency = rollout_batch_size * max_async_level
     max_session_concurrency = max_concurrency * group_size
     max_off_policy_steps = max_async_level + update_weights_interval
+    max_replacement_groups = int(
+        getattr(args, "polar_max_replacement_groups", max(32, rollout_batch_size * 8))
+    )
+    if max_replacement_groups < 0:
+        raise ValueError("polar_max_replacement_groups must be greater than or equal to 0")
 
     request_timeout = getattr(args, "polar_request_timeout", None)
     if request_timeout is not None:
@@ -109,6 +115,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         max_session_concurrency=max_session_concurrency,
         max_async_level=max_async_level,
         max_off_policy_steps=max_off_policy_steps,
+        max_replacement_groups=max_replacement_groups,
         request_timeout=request_timeout,
         callback_host=callback_host,
         scoring_mode=scoring_mode,

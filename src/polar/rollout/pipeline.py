@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -390,6 +391,17 @@ class Pipeline:
 
     async def _cleanup_session(self, session: SessionContext) -> None:
         if self._client is None or session.gateway_url is None:
+            return
+        if (
+            os.environ.get("POLAR_PRESERVE_FAILED_SESSIONS") == "1"
+            and session.rollout_result is not None
+            and session.rollout_result.status != SessionStatus.COMPLETED
+        ):
+            logger.warning(
+                "Preserving failed session %s on gateway %s for diagnostics",
+                session.session_id,
+                session.gateway_url,
+            )
             return
 
         try:

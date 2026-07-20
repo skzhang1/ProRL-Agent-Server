@@ -390,6 +390,7 @@ class AsyncPolarRolloutWorker:
         self._active_groups = 0
         self._active_sessions = 0
         self._completed_buffer_size = 0
+        self._consecutive_dropped_groups = 0
         # Per-task callback plumbing: event fires when the rollout server POSTs
         # the terminal TaskResult to our local listener.
         self._task_events: dict[str, asyncio.Event] = {}
@@ -658,6 +659,7 @@ class AsyncPolarRolloutWorker:
             reason,
             last_error,
         )
+        self._record_dropped_group()
         return
 
     async def _submit_attempt(
@@ -717,6 +719,7 @@ class AsyncPolarRolloutWorker:
             try:
                 self.output_queue.put_nowait(completed)
                 self._inc_metric("polar/completed_groups")
+                self._reset_consecutive_drops()
                 return
             except queue.Full:
                 self._inc_metric("polar/output_queue_full_waits")
@@ -799,6 +802,24 @@ class AsyncPolarRolloutWorker:
     def _inc_metric(self, key: str, amount: float = 1.0) -> None:
         with self._state_lock:
             self._metrics[key] = self._metrics.get(key, 0.0) + amount
+
+    def _record_dropped_group(self) -> None:
+        with self._state_lock:
+            self._consecutive_dropped_groups += 1
+            dropped = self._consecutive_dropped_groups
+        limit = self.config.max_replacement_groups
+        if dropped > limit:
+            self._set_fatal(
+                PolarRolloutSchedulerError(
+                    f"Exceeded polar_max_replacement_groups={limit} without "
+                    "a usable group; stopping unbounded rollout replenishment"
+                )
+            )
+            self._running = False
+
+    def _reset_consecutive_drops(self) -> None:
+        with self._state_lock:
+            self._consecutive_dropped_groups = 0
 
     def _set_fatal(self, exc: BaseException) -> None:
         with self._state_lock:

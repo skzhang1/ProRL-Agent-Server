@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
+import signal
 import shlex
 import shutil
 from pathlib import Path
@@ -25,6 +27,7 @@ class ApptainerRuntime(BaseRuntime):
         short_hash = hashlib.sha256(session_id.encode()).hexdigest()[:8]
         safe_name = session_id.replace("/", "-")[:30]
         self._instance_name = f"polar-{safe_name}-{short_hash}"
+        self._runtime_marker = self._instance_name
         self._binary = self._resolve_binary()
         self._direct_exec = os.environ.get("POLAR_APPTAINER_DIRECT_EXEC", "0") == "1"
 
@@ -38,6 +41,13 @@ class ApptainerRuntime(BaseRuntime):
 
     @property
     def can_disable_internet(self) -> bool:
+        return True
+
+    @property
+    def supports_memory_limits(self) -> bool:
+        # Apptainer does not expose an unprivileged cgroup limit here. Apply a
+        # POSIX address-space rlimit in every container command instead; it is
+        # inherited by forked, exec'd, and daemonized descendants.
         return True
 
     async def start(self) -> None:
@@ -80,6 +90,8 @@ class ApptainerRuntime(BaseRuntime):
             return
         self._destroyed = True
         if self._direct_exec:
+            await self._kill_marked_processes()
+            await self._kill_tracked_process_groups()
             return
         rc, _, stderr = await self._run_local_command(
             self._binary, "instance", "stop", self._instance_name,
@@ -100,6 +112,9 @@ class ApptainerRuntime(BaseRuntime):
         timeout_sec: float | None = None,
     ) -> ExecResult:
         effective_env = {**self.spec.env, **(env or {})}
+        # A daemon can escape its launcher's process group with setsid(). Keep
+        # a unique inherited marker so teardown can still identify it safely.
+        effective_env["POLAR_RUNTIME_ID"] = self._runtime_marker
         effective_workdir = cwd or self.spec.workdir or self.runtime_session_dir
         wrapped_command = command
         if effective_workdir:
@@ -110,6 +125,9 @@ class ApptainerRuntime(BaseRuntime):
                 shell_exports.append(f"export {key}={shlex.quote(str(effective_env[key]))};")
         if shell_exports:
             wrapped_command = " ".join(shell_exports + [wrapped_command])
+        if self.spec.memory_mb is not None:
+            limit_kib = self.spec.memory_mb * 1024
+            wrapped_command = f"ulimit -v {limit_kib}; {wrapped_command}"
         args = [self._binary, "exec"]
         if self._direct_exec:
             args.extend(["--overlay", str(self._overlay_dir)])
@@ -132,6 +150,50 @@ class ApptainerRuntime(BaseRuntime):
             *args, timeout=timeout_sec, capture=True
         )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
+
+    async def _kill_marked_processes(self) -> None:
+        """Kill daemonized descendants that escaped their launch process group."""
+        marker = f"POLAR_RUNTIME_ID={self._runtime_marker}".encode()
+        self_pid = os.getpid()
+        # Repeat because a process can fork while the first /proc pass is in
+        # progress. SIGKILL plus three event-loop yields closes that race for
+        # ordinary runtime teardown without touching unrelated processes.
+        for _ in range(3):
+            found = False
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid == self_pid:
+                    continue
+                try:
+                    environ = (entry / "environ").read_bytes()
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if marker not in environ.split(b"\0"):
+                    continue
+                found = True
+                try:
+                    cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                        errors="replace"
+                    )
+                    try:
+                        pgid = os.getpgid(pid)
+                    except ProcessLookupError:
+                        pgid = None
+                    logger.warning(
+                        "runtime marker SIGKILL runtime=%s pid=%s pgid=%s cmdline=%s",
+                        self._runtime_marker,
+                        pid,
+                        pgid,
+                        cmdline[:1000],
+                    )
+                    os.kill(pid, signal.SIGKILL)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+            if not found:
+                return
+            await asyncio.sleep(0)
 
     async def upload_file(self, local_path: str, remote_path: str) -> None:
         if self._copy_to_bind_mount(local_path, remote_path):
