@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import shutil
 from contextlib import suppress
 from pathlib import Path
@@ -326,8 +327,22 @@ class GatewayNodeManager:
             env = self._runtime_env(request, managed, include_agent_env=True)
             agent_result = await self._run_exec_inputs(runtime, steps, env, managed)
 
+            # SIGKILL means the harness did not produce a trustworthy sample.
+            # The runtime has already been cancelled by _run_exec_inputs;
+            # bypass postprocessing and evaluation so this session is returned
+            # as an infrastructure ERROR and the trainer can replace it.
+            if agent_result.metadata.get("failure_kind") == "infrastructure_sigkill":
+                managed.agent_result = agent_result
+                managed.final_result = self._error_result(
+                    request,
+                    managed.timer,
+                    agent_result.error or "agent wrapper received SIGKILL",
+                    metadata=agent_result.metadata,
+                )
+                return
+
             # Postprocess always runs so harnesses can collect artifacts from
-            # failed or timed-out agent runs before post-run evaluation.
+            # ordinary failed or timed-out agent runs before evaluation.
             await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
             managed.agent_result = agent_result
 
@@ -348,7 +363,12 @@ class GatewayNodeManager:
                     f"agent execution failed: {exc}",
                 )
         finally:
-            if harness is not None:
+            infrastructure_sigkill = (
+                managed.agent_result is not None
+                and managed.agent_result.metadata.get("failure_kind")
+                == "infrastructure_sigkill"
+            )
+            if harness is not None and not infrastructure_sigkill:
                 managed.postrun_steps = harness.postrun_steps()
             managed.timer.mark("run", "finished")
 
@@ -387,6 +407,34 @@ class GatewayNodeManager:
                     return_code=-1,
                     error=f"step {i} timed out",
                     metadata=self._step_metadata(log_dir, i, managed),
+                )
+            if result.return_code == -signal.SIGKILL:
+                metadata = {
+                    **self._step_metadata(log_dir, i, managed),
+                    "failure_kind": "infrastructure_sigkill",
+                    "signal": signal.SIGKILL,
+                    "trainable": False,
+                }
+                logger.error(
+                    "Agent wrapper received SIGKILL; cancelling runtime and "
+                    "discarding session session_id=%s task_id=%s step=%s metadata=%s",
+                    managed.request.session_id,
+                    managed.request.task_id,
+                    i,
+                    metadata,
+                )
+                try:
+                    await runtime.cancel()
+                except Exception:
+                    logger.exception(
+                        "Runtime cleanup after SIGKILL failed for session %s",
+                        managed.request.session_id,
+                    )
+                return AgentRunResult(
+                    status="failed",
+                    return_code=result.return_code,
+                    error=f"infrastructure failure: step {i} received SIGKILL (-9)",
+                    metadata=metadata,
                 )
             if result.return_code != 0:
                 return AgentRunResult(
@@ -785,6 +833,7 @@ class GatewayNodeManager:
     def _write_exec_log(
         log_dir: Path, prefix: str, stdout: str | None, stderr: str | None
     ) -> None:
+        log_dir.mkdir(parents=True, exist_ok=True)
         if stdout:
             (log_dir / f"{prefix}.stdout.log").write_text(stdout)
         if stderr:
@@ -803,7 +852,13 @@ class GatewayNodeManager:
         request: SessionDispatchRequest,
         timer: StageTimer,
         error: str,
+        *,
+        metadata: dict[str, object] | None = None,
     ) -> SessionResult:
+        result_metadata = dict(request.metadata)
+        if metadata:
+            result_metadata.update(metadata)
+
         return SessionResult(
             session_id=request.session_id,
             task_id=request.task_id,
@@ -821,7 +876,7 @@ class GatewayNodeManager:
             timing=timer.to_session_timing(),
             node_id=self.node_id,
             error=error,
-            metadata=dict(request.metadata),
+            metadata=result_metadata,
         )
 
     def _timeout_result(
