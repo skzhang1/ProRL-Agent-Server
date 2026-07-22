@@ -160,14 +160,15 @@ def _build_sample(
     }
     polar_metadata.update(_scheduler_metadata(result, trace))
 
+    grouping_kwargs = _sample_grouping_kwargs(Sample, index)
     return Sample(
         group_index=group_index,
         index=index,
+        **grouping_kwargs,
         prompt=prompt_value,
         tokens=prompt_ids + response_ids,
         response=response_text,
         response_length=len(response_ids),
-        group_id=index,
         reward={reward_key: reward_value},
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
@@ -206,14 +207,15 @@ def _build_dummy_sample(
         "placeholder": True,
     }
     polar_metadata.update(_scheduler_metadata(result, None))
+    grouping_kwargs = _sample_grouping_kwargs(Sample, index)
     return Sample(
         group_index=group_index,
         index=index,
+        **grouping_kwargs,
         prompt="",
         tokens=[0, 0],
         response="",
         response_length=1,
-        group_id=index,
         reward={reward_key: 0.0},
         loss_mask=[0],
         rollout_log_probs=[0.0],
@@ -221,6 +223,26 @@ def _build_dummy_sample(
         remove_sample=True,
         session_id=result.session_id,
         metadata={"polar": polar_metadata},
+    )
+
+
+def _sample_grouping_kwargs(Sample: Any, index: int) -> dict[str, int]:
+    """Select the trajectory-group field supported by the active Slime.
+
+    The proven project Slime calls this field ``group_id``.  The reference
+    DPPO Slime checkout still calls the equivalent field ``rollout_id``.
+    Supporting both keeps Polar's bridge independent of the selected Slime
+    recipe without mutating either Slime checkout.
+    """
+    fields = getattr(Sample, "__dataclass_fields__", None)
+    if fields is None:
+        return {"group_id": index}
+    if "group_id" in fields:
+        return {"group_id": index}
+    if "rollout_id" in fields:
+        return {"rollout_id": index}
+    raise TypeError(
+        "Slime Sample must define either group_id or rollout_id for trajectory grouping"
     )
 
 

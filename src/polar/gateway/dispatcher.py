@@ -72,6 +72,7 @@ class ManagedSession:
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     execution_deadline: float | None = None
+    max_steps_reached: int | None = None
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 
@@ -171,6 +172,20 @@ class SessionDispatcher:
         if should_enqueue_postrun:
             self._notify_stage_change(managed)
             await self._postrun_queue.put(session_id)
+        return True
+
+    async def stop_for_max_steps(self, session_id: str, max_steps: int) -> bool:
+        """Stop the active agent command while preserving the runtime for post-run."""
+        async with self._lock:
+            managed = self._sessions.get(session_id)
+            if managed is None:
+                return False
+            if managed.max_steps_reached is not None:
+                return False
+            managed.max_steps_reached = max_steps
+            runtime = managed.runtime
+        if runtime is not None:
+            await runtime.cancel_active_exec()
         return True
 
     async def active_count(self) -> int:

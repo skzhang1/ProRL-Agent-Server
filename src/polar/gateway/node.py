@@ -166,6 +166,7 @@ class GatewayNodeManager:
                 registered=True,
                 status=SessionStatus.REGISTERED,
                 metadata=dict(request.metadata),
+                max_steps=request.max_steps,
             )
             self.storage.ensure_session(
                 info.session_id,
@@ -202,6 +203,9 @@ class GatewayNodeManager:
 
     async def cancel(self, session_id: str) -> bool:
         return await self._dispatcher.cancel(session_id)
+
+    async def stop_for_max_steps(self, session_id: str, max_steps: int) -> bool:
+        return await self._dispatcher.stop_for_max_steps(session_id, max_steps)
 
     async def active_sessions(self) -> int:
         return await self._dispatcher.active_count()
@@ -401,6 +405,18 @@ class GatewayNodeManager:
             self._write_exec_log(
                 log_dir, f"step.{i:02d}", result.stdout, result.stderr
             )
+            if managed.max_steps_reached is not None:
+                max_steps = managed.max_steps_reached
+                return AgentRunResult(
+                    status="timeout",
+                    return_code=-1,
+                    error=f"session reached max_steps={max_steps}",
+                    metadata={
+                        **self._step_metadata(log_dir, i, managed),
+                        "termination_reason": "max_steps",
+                        "max_steps": max_steps,
+                    },
+                )
             if result.return_code == -1:
                 return AgentRunResult(
                     status="timeout",
@@ -661,6 +677,14 @@ class GatewayNodeManager:
             managed.timer.mark("eval", "finished")
 
         error = trajectory.error or error
+        result_metadata = dict(request.metadata)
+        if managed.max_steps_reached is not None:
+            result_metadata.update(
+                {
+                    "termination_reason": "max_steps",
+                    "max_steps": managed.max_steps_reached,
+                }
+            )
         return SessionResult(
             session_id=request.session_id,
             task_id=request.task_id,
@@ -669,7 +693,7 @@ class GatewayNodeManager:
             timing=managed.timer.to_session_timing(),
             node_id=self.node_id,
             error=error,
-            metadata=dict(request.metadata),
+            metadata=result_metadata,
         )
 
     def _build_trajectory(self, request: SessionDispatchRequest) -> Trajectory:

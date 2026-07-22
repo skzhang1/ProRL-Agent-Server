@@ -23,6 +23,7 @@ def test_sigkill_is_untrainable_and_cancels_runtime(tmp_path):
         )
         managed = SimpleNamespace(
             cancel_requested=False,
+            max_steps_reached=None,
             session_dir=tmp_path,
             request=SimpleNamespace(session_id="session-1", task_id="task-1"),
         )
@@ -39,6 +40,43 @@ def test_sigkill_is_untrainable_and_cancels_runtime(tmp_path):
         assert result.metadata["failure_kind"] == "infrastructure_sigkill"
         assert result.metadata["trainable"] is False
         runtime.cancel.assert_awaited_once_with()
+
+    asyncio.run(run())
+
+
+def test_max_steps_is_a_controlled_timeout_not_infrastructure_sigkill(tmp_path):
+    async def run():
+        manager = object.__new__(GatewayNodeManager)
+        manager._remaining_budget = lambda managed: 30.0
+        runtime = SimpleNamespace(
+            exec=AsyncMock(
+                return_value=ExecResult(
+                    return_code=-signal.SIGKILL,
+                    stdout=None,
+                    stderr=None,
+                )
+            ),
+            cancel=AsyncMock(),
+        )
+        managed = SimpleNamespace(
+            cancel_requested=False,
+            max_steps_reached=160,
+            session_dir=tmp_path,
+            request=SimpleNamespace(session_id="session-1", task_id="task-1"),
+        )
+
+        result = await manager._run_exec_inputs(
+            runtime,
+            [ExecInput(command="pi --print")],
+            {},
+            managed,
+        )
+
+        assert result.status == "timeout"
+        assert result.error == "session reached max_steps=160"
+        assert result.metadata["termination_reason"] == "max_steps"
+        assert result.metadata["max_steps"] == 160
+        runtime.cancel.assert_not_awaited()
 
     asyncio.run(run())
 

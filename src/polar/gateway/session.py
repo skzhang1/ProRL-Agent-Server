@@ -56,6 +56,7 @@ class SessionInfo:
     status: str = SessionStatus.REGISTERED
     result: SessionResult | None = None
     metadata: dict[str, Any] | None = None
+    max_steps: int | None = None
 
 
 class SessionRegistry:
@@ -73,6 +74,7 @@ class SessionRegistry:
         registered: bool = False,
         status: str = SessionStatus.REGISTERED,
         metadata: dict[str, Any] | None = None,
+        max_steps: int | None = None,
     ) -> SessionInfo:
         session_id = clean_session_id(session_id) or generate_session_id()
         now = _utcnow()
@@ -86,6 +88,8 @@ class SessionRegistry:
                 info.status = status or info.status
                 if metadata:
                     info.metadata = {**(info.metadata or {}), **metadata}
+                if max_steps is not None:
+                    info.max_steps = max_steps
                 if status in SessionStatus.active():
                     info.result = None
                 return info
@@ -98,6 +102,7 @@ class SessionRegistry:
                 registered=registered,
                 status=status,
                 metadata=dict(metadata or {}),
+                max_steps=max_steps,
             )
             self._sessions[session_id] = info
             return info

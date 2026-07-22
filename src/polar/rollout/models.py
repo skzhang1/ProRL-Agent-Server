@@ -63,6 +63,7 @@ class TaskRequest(BaseModel):
     instruction: str
     num_samples: int = Field(default=1, ge=1)
     timeout_seconds: float = Field(default=600.0, gt=0)
+    max_steps: int | None = Field(default=None, ge=1)
     runtime: RuntimeSpec | None = None
     agent: AgentSpec
     builder: StrategySpec = Field(default_factory=_default_builder_spec)
@@ -83,6 +84,7 @@ class SessionDispatchRequest(BaseModel):
     task_id: str
     instruction: str
     remaining_timeout_seconds: float = Field(gt=0)
+    max_steps: int | None = Field(default=None, ge=1)
     runtime: RuntimeSpec | None = None
     agent: AgentSpec
     builder: StrategySpec = Field(default_factory=_default_builder_spec)

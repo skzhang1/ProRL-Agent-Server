@@ -79,20 +79,20 @@ class BaseRuntime(ABC):
 
     async def cancel(self) -> None:
         """Stop any in-flight command and tear the runtime down."""
+        await self.cancel_active_exec()
+        await self.stop()
+
+    async def cancel_active_exec(self) -> None:
+        """Stop the in-flight command without tearing down the runtime."""
         process = self._active_process
         if process is not None and process.returncode is None:
             await BaseRuntime._kill_process_group(process)
-        await self.stop()
 
     @staticmethod
     async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
         """SIGKILL a command and every descendant still in its POSIX group."""
-        logger.warning(
-            "runtime killpg active pid=%s pgid=%s members=%s",
-            process.pid,
-            process.pid,
-            BaseRuntime._describe_process_group(process.pid),
-        )
+        # Kill first: scanning /proc here can delay cancellation under load.
+        logger.warning("runtime killpg active pid=%s pgid=%s", process.pid, process.pid)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:

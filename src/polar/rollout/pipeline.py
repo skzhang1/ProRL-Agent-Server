@@ -182,6 +182,7 @@ class Pipeline:
                 task_id=session.task_id,
                 instruction=session.request.instruction,
                 remaining_timeout_seconds=session.request.timeout_seconds,
+                max_steps=session.request.max_steps,
                 callback_url=self.callback_url,
                 runtime=session.request.runtime,
                 agent=session.request.agent,

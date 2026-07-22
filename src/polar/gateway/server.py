@@ -377,6 +377,27 @@ def _completion_metadata(session_info: Any | None) -> dict[str, Any]:
     return metadata
 
 
+async def _stop_if_max_steps_reached(
+    state: GatewayState,
+    session_id: str,
+    session_info: Any | None,
+) -> None:
+    max_steps = getattr(session_info, "max_steps", None)
+    if max_steps is None:
+        return
+    metadata = state.storage.get_session_metadata(session_id) or {}
+    completion_count = int(metadata.get("completion_count", 0))
+    if completion_count < max_steps:
+        return
+    if await state.node_manager.stop_for_max_steps(session_id, max_steps):
+        logger.info(
+            "Session %s reached max_steps=%s after %s completions; stopping agent",
+            session_id,
+            max_steps,
+            completion_count,
+        )
+
+
 def format_stream_output(
     api_type: APIType,
     transformer: BaseTransformer,
@@ -697,6 +718,7 @@ async def _handle_non_streaming(
         created_at=session_info.created_at.isoformat() if session_info else None,
         metadata=_completion_metadata(session_info),
     )
+    await _stop_if_max_steps_reached(state, session_id, session_info)
     transformed = transformer.transform_response(response, original_request)
     return JSONResponse(transformed)
 
@@ -732,6 +754,7 @@ async def _handle_streaming(
         created_at=session_info.created_at.isoformat() if session_info else None,
         metadata=_completion_metadata(session_info),
     )
+    await _stop_if_max_steps_reached(state, session_id, session_info)
 
     synthetic_chunk = _response_to_stream_chunk(response)
     stream_state = transformer.create_stream_state(original_request)
