@@ -31,6 +31,19 @@ def _trajectory_status(status: str) -> str:
     return SessionStatus.ERROR
 
 
+def _is_usable_result(result: SessionResult) -> bool:
+    is_max_steps = (
+        result.status == SessionStatus.TIMEOUT
+        and result.metadata.get("termination_reason") == "max_steps"
+    )
+    if result.status != SessionStatus.COMPLETED and not is_max_steps:
+        return False
+    return any(
+        trace.prompt_ids and trace.response_ids and trace.loss_mask and any(trace.loss_mask)
+        for trace in result.trajectory.traces
+    )
+
+
 class Pipeline:
     """Process rollout sessions by dispatching to gateway nodes and collecting results."""
 
@@ -89,9 +102,61 @@ class Pipeline:
         on_result: ResultCallback | None = None,
     ) -> list[SessionResult]:
         await self.start()
-        return await asyncio.gather(
-            *(self._dispatch_and_collect(session, on_result) for session in sessions)
-        )
+        if not sessions:
+            return []
+
+        threshold = sessions[0].request.early_stop_min_usable_sessions
+        if threshold is None:
+            return await asyncio.gather(
+                *(self._dispatch_and_collect(session, on_result) for session in sessions)
+            )
+
+        collected_results: asyncio.Queue[tuple[int, SessionResult]] = asyncio.Queue()
+
+        async def _run_one(index: int, session: SessionContext) -> SessionResult:
+            return await self._dispatch_and_collect(
+                session,
+                on_result,
+                on_collected=lambda result: collected_results.put_nowait((index, result)),
+            )
+
+        tasks = [
+            asyncio.create_task(
+                _run_one(index, session),
+                name=f"polar-session-{session.session_id}",
+            )
+            for index, session in enumerate(sessions)
+        ]
+        ordered_results: list[SessionResult | None] = [None] * len(sessions)
+        usable_sessions = 0
+        early_stop_triggered = False
+        try:
+            for _ in sessions:
+                index, result = await collected_results.get()
+                ordered_results[index] = result
+                if _is_usable_result(result):
+                    usable_sessions += 1
+
+                if not early_stop_triggered and usable_sessions >= threshold:
+                    early_stop_triggered = True
+                    for session, task in zip(sessions, tasks, strict=True):
+                        if task.done() or session.rollout_result is not None:
+                            continue
+                        session.early_stop_requested = True
+                        session.early_stop_usable_sessions = usable_sessions
+                        task.cancel()
+
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for session, task in zip(sessions, tasks, strict=True):
+                session.early_stop_requested = False
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        assert all(result is not None for result in ordered_results)
+        return [result for result in ordered_results if result is not None]
 
     async def accept_callback_result(self, result: SessionResult) -> bool:
         async with self._pending_lock:
@@ -114,54 +179,73 @@ class Pipeline:
         self,
         session: SessionContext,
         callback: ResultCallback | None,
+        on_collected: Callable[[SessionResult], None] | None = None,
     ) -> SessionResult:
         if self._client is None:
             raise RuntimeError("pipeline has not been started")
 
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
+        future = asyncio.get_running_loop().create_future()
         session.completion_future = future
         async with self._pending_lock:
             self._pending[session.session_id] = future
 
-        session.timer.mark("dispatch", "started")
-        await self._emit(
-            "session.state_changed",
-            {"task_id": session.task_id, "session_id": session.session_id, "status": "DISPATCHING"},
-        )
         try:
-            dispatch_request = await self._dispatch_session(session)
-            session.timer.mark("dispatch", "finished")
+            session.timer.mark("dispatch", "started")
             await self._emit(
                 "session.state_changed",
                 {
                     "task_id": session.task_id,
                     "session_id": session.session_id,
-                    "status": "REGISTERED",
-                    "node_id": session.node_id,
+                    "status": "DISPATCHING",
                 },
             )
-            result = await self._wait_for_result(session, dispatch_request, future)
-        except TimeoutError as exc:
-            logger.warning("Session %s timed out in rollout pipeline", session.session_id)
-            result = self._failure_result(session, status=SessionStatus.TIMEOUT, error=str(exc))
-        except Exception as exc:
-            logger.exception("Dispatch failed for session %s", session.session_id)
-            result = self._failure_result(session, error=str(exc))
-        finally:
-            async with self._pending_lock:
-                self._pending.pop(session.session_id, None)
+            try:
+                dispatch_request = await self._dispatch_session(session)
+                session.timer.mark("dispatch", "finished")
+                await self._emit(
+                    "session.state_changed",
+                    {
+                        "task_id": session.task_id,
+                        "session_id": session.session_id,
+                        "status": "REGISTERED",
+                        "node_id": session.node_id,
+                    },
+                )
+                result = await self._wait_for_result(session, dispatch_request, future)
+            except asyncio.CancelledError:
+                if not session.early_stop_requested:
+                    raise
+                result = self._early_stop_result(session)
+            except TimeoutError as exc:
+                logger.warning("Session %s timed out in rollout pipeline", session.session_id)
+                result = self._failure_result(
+                    session,
+                    status=SessionStatus.TIMEOUT,
+                    error=str(exc),
+                )
+            except Exception as exc:
+                logger.exception("Dispatch failed for session %s", session.session_id)
+                result = self._failure_result(session, error=str(exc))
+            finally:
+                async with self._pending_lock:
+                    self._pending.pop(session.session_id, None)
 
-        await asyncio.to_thread(self._persist_result, result)
-        session.rollout_result = result
-        try:
+            session.rollout_result = result
+            if on_collected is not None:
+                on_collected(result)
+            await asyncio.to_thread(self._persist_result, result)
             if callback is not None:
                 maybe_awaitable = callback(result)
                 if inspect.isawaitable(maybe_awaitable):
                     await maybe_awaitable
             return result
         finally:
-            await self._cleanup_session(session)
+            cleanup_task = asyncio.create_task(self._cleanup_session(session))
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
 
     async def _dispatch_session(self, session: SessionContext) -> SessionDispatchRequest:
         if self._client is None:
@@ -395,6 +479,7 @@ class Pipeline:
             return
         if (
             os.environ.get("POLAR_PRESERVE_FAILED_SESSIONS") == "1"
+            and not session.early_stop_requested
             and session.rollout_result is not None
             and session.rollout_result.status != SessionStatus.COMPLETED
         ):
@@ -447,6 +532,44 @@ class Pipeline:
             trajectory.pop("status", None)
             trajectory.pop("error", None)
         return payload
+
+    @staticmethod
+    def _early_stop_result(session: SessionContext) -> SessionResult:
+        threshold = session.request.early_stop_min_usable_sessions
+        error = (
+            "session cancelled after rollout batch reached its minimum usable "
+            f"session count ({session.early_stop_usable_sessions}/{threshold})"
+        )
+        cancellation_metadata: dict[str, object] = {
+            "early_stop_cancelled": True,
+            "fully_masked": True,
+            "early_stop_reason": "minimum_usable_sessions_reached",
+            "early_stop_min_usable_sessions": threshold,
+            "early_stop_usable_sessions": session.early_stop_usable_sessions,
+        }
+        result_metadata = dict(session.request.metadata)
+        result_metadata.update(cancellation_metadata)
+        trajectory_metadata: dict[str, object] = {
+            "builder": session.request.builder.strategy,
+            "record_count": 0,
+            "task_metadata": dict(session.request.metadata),
+        }
+        trajectory_metadata.update(cancellation_metadata)
+        return SessionResult(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            status=SessionStatus.ERROR,
+            trajectory=Trajectory(
+                status=SessionStatus.ERROR,
+                metadata=trajectory_metadata,
+                traces=[],
+                error=error,
+            ),
+            timing=session.timer.to_session_timing(),
+            node_id=session.node_id,
+            error=error,
+            metadata=result_metadata,
+        )
 
     @staticmethod
     def _failure_result(

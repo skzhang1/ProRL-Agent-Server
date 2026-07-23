@@ -104,6 +104,16 @@ def test_complete_accept_fraction_requires_trainable_completed_sessions() -> Non
     )
 
 
+def test_complete_accept_fraction_counts_controlled_max_steps_only() -> None:
+    task_result = _task_result(["COMPLETED", "TIMEOUT", "TIMEOUT"])
+    task_result.results[0].metadata = {}
+    task_result.results[1].metadata = {"termination_reason": "max_steps"}
+    task_result.results[2].metadata = {"termination_reason": "session_timeout"}
+    samples = [_sample(i) for i in range(3)]
+
+    assert _completed_trainable_session_count(task_result, samples) == 2
+
+
 def test_async_worker_only_admits_requested_groups() -> None:
     worker = AsyncPolarRolloutWorker(_worker_args(), data_source=SimpleNamespace())
 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import signal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -162,6 +163,45 @@ def test_runtime_stop_uses_sigterm_when_process_exits(monkeypatch):
     monkeypatch.setattr("polar.runtime.base.os.killpg", killpg)
     asyncio.run(BaseRuntime._kill_process_group(process))
     assert signals == [signal.SIGTERM]
+
+
+def test_cancelled_local_command_stops_process_group(tmp_path):
+    async def run():
+        runtime = ApptainerRuntime(
+            RuntimeSpec(backend="apptainer", image="/tmp/task.sif"),
+            "cancel-test",
+            tmp_path,
+        )
+        task = asyncio.create_task(
+            runtime._run_local_command(
+                "bash", "-lc", "while true; do sleep 1; done"
+            )
+        )
+        for _ in range(100):
+            if runtime._active_process is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime._active_process is not None
+        pid = runtime._active_process.pid
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled command did not propagate cancellation")
+
+        assert runtime._active_process is None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError(f"cancelled child process {pid} is still alive")
+
+    asyncio.run(run())
+
 
 
 def test_apptainer_isolates_pid_namespace_by_default(tmp_path, monkeypatch):

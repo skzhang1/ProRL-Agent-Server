@@ -9,12 +9,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 project_root="${project_root:-$(cd -- "${script_dir}/../.." && pwd)}"
 reference_recipe="${reference_recipe:-0}"
 polar_project_root="${polar_project_root:-${project_root}}"
-wandb_compat_dir="${script_dir}/tmp/wandb_compat"
 runtime_project_src="${polar_project_root}/src"
-if [ "${reference_recipe}" = "1" ] && [ "${use_wandb:-1}" = "1" ]; then
-    [ -f "${wandb_compat_dir}/sitecustomize.py" ] || { printf 'ERROR: missing W\&B compatibility shim: %s\n' "${wandb_compat_dir}/sitecustomize.py" >&2; exit 1; }
-    runtime_project_src="${wandb_compat_dir}:${runtime_project_src}"
-fi
 cd "${project_root}"
 
 log() {
@@ -257,6 +252,9 @@ use_tis="${use_tis:-0}"
 eps_clip="${eps_clip:-0.2}"
 eps_clip_high="${eps_clip_high:-0.28}"
 eps_clip_c="${eps_clip_c:-10.0}"
+calculate_per_token_loss="${calculate_per_token_loss:-0}"
+max_train_rollout_logprob_abs_diff="${max_train_rollout_logprob_abs_diff:-1.0}"
+dynamic_sampling_filter_path="${dynamic_sampling_filter_path-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 
 polar_builder_strategy="${polar_builder_strategy:-prefix_merging}"
 polar_min_complete_accept_fraction="${polar_min_complete_accept_fraction:-0.6}"
@@ -481,6 +479,44 @@ for name in ("communicator.py", "common.py"):
 PY
 }
 
+
+patch_wandb_compat() {
+    "${python_bin}" - "${slime_dir}/slime/utils/wandb_utils.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+legacy_finish_timeout = "            finish_timeout=finish_timeout,\n"
+legacy_count = text.count(legacy_finish_timeout)
+if legacy_count == 2:
+    text = text.replace(legacy_finish_timeout, "")
+    path.write_text(text, encoding="utf-8")
+elif legacy_count != 0:
+    raise SystemExit(
+        f"expected zero or two legacy W&B finish_timeout arguments in {path}; "
+        f"found {legacy_count}"
+    )
+worker_finish_timeout = "        finish_timeout=_wandb_finish_timeout_seconds(),\n"
+worker_count = text.count(worker_finish_timeout)
+if worker_count == 2:
+    text = text.replace(worker_finish_timeout, "")
+    path.write_text(text, encoding="utf-8")
+elif worker_count != 0:
+    raise SystemExit(
+        f"expected zero or two worker W&B finish_timeout arguments in {path}; "
+        f"found {worker_count}"
+    )
+stable_id_lines = (
+    "    if args.wandb_run_id is not None:",
+    '        init_kwargs["id"] = args.wandb_run_id',
+    '        init_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")',
+)
+if not all(line in text for line in stable_id_lines):
+    raise SystemExit(f"missing native W&B stable run-id support in {path}")
+PY
+}
+
 patch_runtime() {
     router_patch="${project_root}/scripts/patch/patch_slime_router_tokens.sh"
     if [ -f "${router_patch}" ]; then
@@ -488,35 +524,6 @@ patch_runtime() {
     else
         log "WARNING: optional Slime router token patch is unavailable: ${router_patch}"
     fi
-    # Slime's primary W&B process currently ignores --wandb-run-id on its
-    # first init. Honor the stable id so successive Slurm allocations resume
-    # one logical experiment instead of creating disconnected runs.
-    "${python_bin}" - "${slime_dir}/slime/utils/wandb_utils.py" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-old = '''    wandb.init(**init_kwargs)
-
-    _init_wandb_common()
-'''
-new = '''    if args.wandb_run_id is not None:
-        init_kwargs["id"] = args.wandb_run_id
-        init_kwargs["name"] = args.wandb_run_id
-        init_kwargs["resume"] = "allow"
-
-    wandb.init(**init_kwargs)
-
-    _init_wandb_common()
-'''
-if new in text:
-    pass
-elif old in text:
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
-else:
-    raise SystemExit(f"unexpected primary W&B init block in {path}")
-PY
     # Slime has a rollout-count stopping condition but no Megatron-style
     # wall-clock exit. Add a safe-boundary exit to train_async.py: do not launch
     # another speculative rollout, synchronously save the trained model and
@@ -1559,17 +1566,27 @@ PY
         global_batch_args=(--global-batch-size "${global_batch_size}")
     fi
 
+    local loss_reduction_args=()
+    if [ "${calculate_per_token_loss}" = "1" ]; then
+        loss_reduction_args=(--calculate-per-token-loss)
+    fi
+
     local algorithm_args=()
     local graceful_exit_args=()
     if [ "${reference_recipe}" = "1" ]; then
+        local dynamic_sampling_args=()
+        if [ -n "${dynamic_sampling_filter_path}" ]; then
+            dynamic_sampling_args=(--dynamic-sampling-filter-path "${dynamic_sampling_filter_path}")
+        fi
         algorithm_args=(
             --disable-grpo-std-normalization
             --policy-loss-type dppo
+            "${loss_reduction_args[@]}"
             --use-rollout-logprobs
             --dppo-divergence-type tv
             --dppo-divergence-threshold 0.1
-            --max-train-rollout-logprob-abs-diff 1.0
-            --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+            --max-train-rollout-logprob-abs-diff "${max_train_rollout_logprob_abs_diff}"
+            "${dynamic_sampling_args[@]}"
             --balance-data
             --async-strategy mcore
             --seq-length "${max_tokens_per_gpu}"
@@ -1758,6 +1775,7 @@ fi
 
 ensure_current_checkouts
 SLIME_DIR="${slime_dir}" bash "${project_root}/scripts/patch/patch_slime_megatron_compat.sh"
+patch_wandb_compat
 if [ "${reference_recipe}" = "1" ]; then
     patch_container_runtime
 else

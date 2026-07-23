@@ -197,7 +197,9 @@ class NodeScheduler:
 
     @staticmethod
     def _node_score(node: GatewayNode) -> tuple[float, float, float, float, float, str]:
-        run_pressure = node.metrics.run_inflight / node.max_run_workers
+        run_pressure = (
+            node.metrics.run_inflight + node.dispatch_reservations
+        ) / node.max_run_workers
         postrun_pressure = (
             node.metrics.postrun_inflight + node.metrics.postrun_queue_depth
         ) / node.max_postrun_workers

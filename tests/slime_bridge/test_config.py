@@ -32,6 +32,7 @@ def _args(**overrides):
         "polar_callback_host": "127.0.0.1",
         "polar_scoring_mode": "group",
         "polar_min_complete_accept_fraction": 0.0,
+        "polar_early_stop_grace_sessions": 2,
         "hf_checkpoint": "tokenizer-name",
         "polar_add_generation_prompt": True,
         "polar_eval_dataset_name": "eval",
@@ -95,9 +96,32 @@ def test_render_task_payload_resolves_args_and_sample_placeholders() -> None:
     assert payload["task_id"] == "task-2-9"
     assert payload["instruction"] == "Fix the bug"
     assert payload["num_samples"] == 4
+    assert "early_stop_min_usable_sessions" not in payload
     assert payload["agent"]["model_name"] == "openai/gpt-test"
     assert payload["runtime"]["image"] == "runtime:latest"
     assert payload["metadata"]["instance"] == "abc123"
+
+
+def test_render_task_payload_sets_early_stop_threshold_with_grace() -> None:
+    args = _args(polar_min_complete_accept_fraction=0.5)
+    config = resolve_polar_slime_config(args)
+    sample = SimpleNamespace(
+        prompt="prompt",
+        metadata={"image": "runtime:latest", "instance_id": "abc123"},
+        group_index=0,
+    )
+
+    payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=sample,
+        instruction="Fix the bug",
+        rollout_id=0,
+        task_position=0,
+        num_rollouts=32,
+    )
+
+    assert payload["early_stop_min_usable_sessions"] == 18
 
 
 def test_render_instruction_uses_optional_template() -> None:

@@ -295,8 +295,14 @@ def _completed_trainable_session_count(
 
     count = 0
     for result in task_result.results:
+        status = _status_value(result.status)
+        metadata = getattr(result, "metadata", {}) or {}
+        controlled_max_steps = (
+            status == "TIMEOUT"
+            and metadata.get("termination_reason") == "max_steps"
+        )
         if (
-            _status_value(result.status) == "COMPLETED"
+            (status == "COMPLETED" or controlled_max_steps)
             and result.session_id in trainable_session_ids
         ):
             count += 1

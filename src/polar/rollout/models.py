@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from polar.agent.models import AgentSpec
 from polar.runtime.models import RuntimeSpec
@@ -62,6 +62,7 @@ class TaskRequest(BaseModel):
     task_id: str
     instruction: str
     num_samples: int = Field(default=1, ge=1)
+    early_stop_min_usable_sessions: int | None = Field(default=None, ge=1)
     timeout_seconds: float = Field(default=600.0, gt=0)
     max_steps: int | None = Field(default=None, ge=1)
     runtime: RuntimeSpec | None = None
@@ -70,6 +71,13 @@ class TaskRequest(BaseModel):
     evaluator: EvaluatorSpec | None = None
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_early_stop_threshold(self) -> "TaskRequest":
+        threshold = self.early_stop_min_usable_sessions
+        if threshold is not None and threshold > self.num_samples:
+            raise ValueError("early_stop_min_usable_sessions cannot exceed num_samples")
+        return self
 
 
 class SessionDispatchRequest(BaseModel):
@@ -219,6 +227,8 @@ class SessionContext:
     gateway_url: str | None = None
     timer: "StageTimer" = field(default_factory=_new_stage_timer)
     rollout_result: SessionResult | None = None
+    early_stop_requested: bool = field(default=False, repr=False)
+    early_stop_usable_sessions: int = field(default=0, repr=False)
     completion_future: asyncio.Future[SessionResult] | None = field(
         default=None,
         repr=False,

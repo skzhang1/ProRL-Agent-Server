@@ -46,6 +46,20 @@ def test_acquire_prefers_lower_run_pressure_before_init_pressure() -> None:
     assert selected.dispatch_reservations == 1
 
 
+def test_dispatch_reservations_balance_a_burst_against_stale_run_metrics() -> None:
+    scheduler = NodeScheduler()
+    _register(scheduler, "recently-idle", max_run_workers=64)
+    _register(scheduler, "stale-one-run", max_run_workers=64)
+    scheduler.heartbeat(
+        "stale-one-run",
+        metrics=NodeStageMetrics(run_inflight=1),
+    )
+
+    selected = [scheduler.acquire_node().node_id for _ in range(3)]
+
+    assert selected == ["recently-idle", "stale-one-run", "recently-idle"]
+
+
 def test_release_reservation_decrements_dispatch_pressure() -> None:
     scheduler = NodeScheduler()
     _register(scheduler, "node-a")

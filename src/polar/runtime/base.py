@@ -317,6 +317,14 @@ class BaseRuntime(ABC):
                 except asyncio.TimeoutError:
                     await BaseRuntime._kill_process_group(process)
                     return -1, None, None
+        except asyncio.CancelledError:
+            # A cancelled session must not abandon its Apptainer exec client.
+            # Stop the command group before runtime teardown stops the
+            # instance; otherwise the client can surface as an unexplained
+            # SIGKILL even though the session was intentionally cancelled.
+            if process.returncode is None:
+                await asyncio.shield(BaseRuntime._kill_process_group(process))
+            raise
         finally:
             monitor_task.cancel()
             try:

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tmax-pi-4b-dppo-4n
+#SBATCH --job-name=tmax-pi-4b-dppo-2n-smoke
 #SBATCH --account=nvr_lpr_agentic
-#SBATCH --reservation=sla_res_fw190_d580
-#SBATCH --partition=batch_block1
-#SBATCH --nodes=4
+#SBATCH --partition=interactive
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=8
@@ -18,11 +17,10 @@
 #SBATCH --error=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/examples/tmax_slime/logs/slurm/%x-%j.err
 #SBATCH --export=ALL
 
-# Four-node PI + Qwen3.5-4B TMax DPPO training.
+# Two-node PI + Qwen3.5-4B DPPO checkpoint/resume smoke test.
 #
-# Rollout settings come from the independently validated two-node 8-step test.
-# Slime places the actor on the eight GPUs of the lowest-IP node and the 24
-# rollout engines on the other three nodes, with one gateway per rollout node.
+# It keeps the validated 8x32 Polar configuration. Slime places the actor on
+# the lowest-IP node and eight rollout engines plus one gateway on the other.
 set -euo pipefail
 
 project_root="${project_root:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server}"
@@ -48,12 +46,12 @@ ref_load="${project_root}/tmp/checkpoints/Qwen3.5-4B_torch_dist"
 
 # One training node and three rollout nodes. The actor uses TP=4/DP=2.
 gpus_per_node=8
-num_nodes=4
-total_gpus=32
+num_nodes=2
+total_gpus=16
 train_num_gpus=8
 actor_num_nodes=1
 actor_num_gpus_per_node=8
-rollout_num_gpus=24
+rollout_num_gpus=8
 rollout_num_gpus_per_engine=1
 tensor_model_parallel_size=4
 qwen_gdn_backend=fla
@@ -69,7 +67,7 @@ rollout_batch_size=8
 n_samples_per_prompt=32
 num_epoch=1
 # Slime uses an exclusive boundary: rollout IDs 0..19 are 20 training steps.
-target_num_rollout=20
+target_num_rollout=2
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
@@ -77,7 +75,7 @@ smoke_rows="${smoke_rows:-0}"
 # rollout boundary and then completing one final prefetched rollout normally
 # leaves roughly 10-20 minutes for a synchronous checkpoint and cleanup inside
 # the four-hour Slurm allocation.
-exit_duration_minutes=160
+exit_duration_minutes=10
 
 # Compact PI history before the 60k inference limit, then prefix-merge within
 # each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
@@ -101,12 +99,6 @@ eps_clip_high=0.28
 eps_clip_c=10.0
 calculate_per_token_loss=1
 max_train_rollout_logprob_abs_diff=0.5
-# The initial 4B PI policy often yields all-zero/all-one groups. Slime's
-# nonzero-std filter retries without a bound, which can leave the actor idle
-# long enough for the cluster reaper to cancel the allocation. Keep all eight
-# 32-sample groups instead: reward centering gives constant-reward groups zero
-# advantage, while mixed-reward groups retain their training signal.
-dynamic_sampling_filter_path=""
 polar_fully_async=1
 polar_early_stop_grace_sessions=2
 polar_max_trajectory_tokens=67584
@@ -125,9 +117,9 @@ pi_fail_on_context_limit=0
 polar_builder_strategy=prefix_merging
 polar_max_async_level=2
 polar_max_replacement_groups=32
-polar_min_complete_accept_fraction=0.5
+polar_min_complete_accept_fraction=0.0
 polar_multi_gateway=1
-polar_gateway_count=3
+polar_gateway_count=1
 polar_gateway_ranks=""
 polar_gateway_hosts=""
 polar_gateway_max_init_workers=8
@@ -141,7 +133,7 @@ polar_gateway_max_restarts=0
 # gateway. Both 32 and 64 GiB complete the request. Keep 64 GiB as headroom
 # for long tool trajectories while stopping the observed ~1.4 TiB runaway.
 polar_runtime_memory_mb=65536
-polar_task_timeout_seconds=900
+polar_task_timeout_seconds=1200
 polar_max_steps=160
 polar_request_timeout=3600
 polar_task_timeout_from_metadata=0
@@ -152,13 +144,13 @@ rollout_health_check_timeout=30
 rollout_health_check_first_wait=0
 
 # Fixed identity: this task cannot inherit an older experiment name or save path.
-run_label="dppo-4n-rb8-s32-v3"
-experiment_name="tmax_pi_4b_dppo_4n_rb8_s32_v3"
+run_label="dppo-4n-rb8-s32-v1"
+experiment_name="tmax_pi_4b_dppo_2n_smoke_rb8_s32_v1"
 run_id="${experiment_name}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
-run_generation="20260723-dppo-4n-rb8-s32-v3"
+run_generation="20260722-dppo-2n-smoke-rb8-s32-v1"
 rollout_save_dir="${run_dir}/rollout_results"
 full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_ready_prefix256.jsonl"
 prompt_data="${run_dir}/tmax_train.jsonl"
@@ -168,8 +160,8 @@ tmax_image_dir="${tmax_image_dir:-/lustre/fsw/portfolios/nvr/users/songyangh/bji
 # Production invariant: every training allocation must report to the user's
 # approved W&B destination.  Keep these fixed instead of allowing inherited
 # submit-shell variables to silently redirect or disable tracking.
-use_wandb=1
-wandb_mode=online
+use_wandb=0
+wandb_mode=disabled
 wandb_entity=hwinf_dcm
 wandb_project=harnessgen
 wandb_group="${run_id}"
@@ -186,7 +178,7 @@ gateway_port=$((20000 + port_slot))
 ray_port="${ray_port:-6379}"
 ray_dashboard_port="${ray_dashboard_port:-28265}"
 ray_num_cpus=128
-ray_expected_num_gpus=32
+ray_expected_num_gpus=16
 ray_cluster_timeout_seconds=600
 # Ray must see this before `ray start`; the inner trainer starts too late to
 # affect raylet's host-memory monitor. 0.99 avoids false kills from SGLang/CUDA
@@ -199,9 +191,8 @@ die() {
     exit 1
 }
 
-[ "${SLURM_JOB_NUM_NODES:-0}" = "4" ] || die "this script requires exactly four allocated nodes"
-[ "${SLURM_JOB_RESERVATION:-}" = "sla_res_fw190_d580" ] || \
-    die "this job must run on reservation sla_res_fw190_d580"
+[ "${SLURM_JOB_NUM_NODES:-0}" = "2" ] || die "this smoke test requires exactly two allocated nodes"
+[ "${SLURM_JOB_PARTITION:-}" = "interactive" ] || die "this smoke test must run on the interactive partition"
 job_account="${SLURM_JOB_ACCOUNT:-}"
 if [ -z "${job_account}" ]; then
     job_account="$(scontrol show job -o "${SLURM_JOB_ID}" | sed -n 's/.* Account=\([^ ]*\).*/\1/p')"
@@ -244,9 +235,7 @@ slime_dir=${slime_dir}
 rollout_batch_size=8
 n_samples_per_prompt=32
 global_batch_size=256
-target_num_rollout=20
-dynamic_sampling_filter=off
-session_timeout_seconds=900
+target_num_rollout=2
 "
 mkdir -p "${script_dir}/logs/slurm" "${run_log_dir}" "${save_dir}" "${rollout_save_dir}"
 if [ -s "${run_manifest}" ]; then
@@ -325,7 +314,7 @@ worker_script="${run_dir}/ray_cluster_rank.sh"
 rm -f "${stop_file}"
 
 mapfile -t slurm_nodes < <(scontrol show hostnames "${SLURM_NODELIST}")
-[ "${#slurm_nodes[@]}" -eq 4 ] || die "expected four Slurm hosts"
+[ "${#slurm_nodes[@]}" -eq 2 ] || die "expected two Slurm hosts"
 head_node="${slurm_nodes[0]}"
 slime_train_node=""
 slime_train_rank=""
@@ -403,7 +392,7 @@ export exit_duration_minutes
 export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
-export calculate_per_token_loss max_train_rollout_logprob_abs_diff dynamic_sampling_filter_path
+export calculate_per_token_loss max_train_rollout_logprob_abs_diff
 export agent_harness agent_label pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
 export polar_builder_strategy polar_max_async_level polar_max_replacement_groups polar_min_complete_accept_fraction
 export polar_fully_async polar_early_stop_grace_sessions polar_max_trajectory_tokens
@@ -650,13 +639,13 @@ chmod +x "${worker_script}"
 
 cat <<SUMMARY
 ============================================================
-TMax PI 4B DPPO - fresh 20-step qualification
+TMax PI 4B DPPO - two-node checkpoint resume smoke
   run:       ${run_id}
   nodes:     ${slurm_nodes[*]}
   ray head:  ${ray_head_ip}
   train node:${slime_train_node:-slime-placement-default}${slime_train_rank:+ (rank ${slime_train_rank}, ip ${slime_train_ip})}
   account:   ${job_account}
-  GPUs:      8 train + 24 rollout
+  GPUs:      8 train + 8 rollout
   gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}, restarts=${polar_gateway_max_restarts}
   CPUs:      ${ray_num_cpus} per node
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}

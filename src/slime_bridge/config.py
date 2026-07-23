@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ class PolarSlimeConfig:
     callback_host: str
     scoring_mode: str
     min_complete_accept_fraction: float
+    early_stop_grace_sessions: int
     tokenizer_name_or_path: str | None
     add_generation_prompt: bool
     eval_dataset_name: str
@@ -98,6 +100,11 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     )
     if not 0.0 <= min_complete_accept_fraction <= 1.0:
         raise ValueError("polar_min_complete_accept_fraction must be between 0 and 1")
+    early_stop_grace_sessions = int(
+        getattr(args, "polar_early_stop_grace_sessions", 2) or 0
+    )
+    if early_stop_grace_sessions < 0:
+        raise ValueError("polar_early_stop_grace_sessions must be non-negative")
 
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
@@ -120,6 +127,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         callback_host=callback_host,
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
+        early_stop_grace_sessions=early_stop_grace_sessions,
         tokenizer_name_or_path=getattr(args, "hf_checkpoint", None),
         add_generation_prompt=bool(getattr(args, "polar_add_generation_prompt", True)),
         eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),
@@ -159,6 +167,12 @@ def render_task_payload(
     payload["task_id"] = str(_render_template_value(config.task_id_template, context))
     payload["instruction"] = instruction
     payload["num_samples"] = num_rollouts
+    if 0.0 < config.min_complete_accept_fraction < 1.0:
+        required = math.ceil(num_rollouts * config.min_complete_accept_fraction)
+        payload["early_stop_min_usable_sessions"] = min(
+            num_rollouts,
+            required + config.early_stop_grace_sessions,
+        )
     return payload
 
 
