@@ -175,7 +175,7 @@ class SessionDispatcher:
         return True
 
     async def stop_for_max_steps(self, session_id: str, max_steps: int) -> bool:
-        """Stop the active agent command while preserving the runtime for post-run."""
+        """Stop the whole runtime so detached agent children cannot survive."""
         async with self._lock:
             managed = self._sessions.get(session_id)
             if managed is None:
@@ -185,7 +185,7 @@ class SessionDispatcher:
             managed.max_steps_reached = max_steps
             runtime = managed.runtime
         if runtime is not None:
-            await runtime.cancel_active_exec()
+            await runtime.cancel()
         return True
 
     async def active_count(self) -> int:

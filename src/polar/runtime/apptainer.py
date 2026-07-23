@@ -30,6 +30,10 @@ class ApptainerRuntime(BaseRuntime):
         self._runtime_marker = self._instance_name
         self._binary = self._resolve_binary()
         self._direct_exec = os.environ.get("POLAR_APPTAINER_DIRECT_EXEC", "0") == "1"
+        self._isolate_pid = os.environ.get(
+            "POLAR_APPTAINER_ISOLATE_PID", "1"
+        ) == "1"
+        self._exec_sequence = 0
 
     @property
     def runtime_id(self) -> str:
@@ -61,6 +65,10 @@ class ApptainerRuntime(BaseRuntime):
             return
         args = [self._binary, "instance", "start",
                 "--overlay", str(self._overlay_dir)]
+        if self._isolate_pid:
+            # The deployed patched binary exposes PID isolation through
+            # --containall (it does not implement a standalone --pid flag).
+            args.append("--containall")
         if self.spec.gpus > 0:
             args.append("--nv")
         network_name: str | None
@@ -128,9 +136,36 @@ class ApptainerRuntime(BaseRuntime):
         if self.spec.memory_mb is not None:
             limit_kib = self.spec.memory_mb * 1024
             wrapped_command = f"ulimit -v {limit_kib}; {wrapped_command}"
+
+        inner_status_path: Path | None = None
+        if not self._direct_exec:
+            # The Apptainer exec client can receive SIGKILL while the command
+            # keeps running inside a long-lived instance. Record the command's
+            # real status through the session bind mount so wrapper signals are
+            # not mistaken for agent failures.
+            self._exec_sequence += 1
+            status_name = f".polar-exec-{self._exec_sequence}.status"
+            inner_status_path = self.session_dir / status_name
+            inner_status_path.unlink(missing_ok=True)
+            runtime_status_path = f"{self.runtime_session_dir}/{status_name}"
+            supervised_command = (
+                "_polar_write_status() { _polar_rc=$?; trap - EXIT; "
+                f"printf '%s\\n' \"$_polar_rc\" > {shlex.quote(runtime_status_path)}; "
+                'exit "$_polar_rc"; }; '
+                "trap _polar_write_status EXIT; "
+                f"{wrapped_command}"
+            )
+            # Keep the status-writing shell outside the Apptainer exec
+            # client's process group. The EXIT trap records natural exits and
+            # SIGTERM; a true SIGKILL still cannot run the trap.
+            wrapped_command = (
+                f"setsid --wait bash -lc {shlex.quote(supervised_command)}"
+            )
         args = [self._binary, "exec"]
         if self._direct_exec:
             args.extend(["--overlay", str(self._overlay_dir)])
+            if self._isolate_pid:
+                args.append("--containall")
             if self.spec.gpus > 0:
                 args.append("--nv")
             network_name = "none" if not self.spec.allow_internet else self.spec.network
@@ -149,6 +184,29 @@ class ApptainerRuntime(BaseRuntime):
         rc, stdout, stderr = await self._run_local_command(
             *args, timeout=timeout_sec, capture=True
         )
+        if inner_status_path is not None and inner_status_path.is_file():
+            try:
+                inner_rc = int(inner_status_path.read_text().strip())
+                semantic_rc = inner_rc
+                if semantic_rc != rc:
+                    logger.warning(
+                        "Apptainer exec wrapper rc=%s but inner command rc=%s "
+                        "for %s; using inner status",
+                        rc, semantic_rc, self._instance_name,
+                    )
+                rc = semantic_rc
+            except (OSError, ValueError):
+                logger.warning("Invalid inner exit status: %s", inner_status_path)
+            finally:
+                inner_status_path.unlink(missing_ok=True)
+        elif inner_status_path is not None and rc == -signal.SIGKILL:
+            # The wrapper is in a separate session. Without an inner status,
+            # SIGKILL reached the supervised command group itself, so retain
+            # its partial trajectory as an ordinary agent failure.
+            rc = 128 + signal.SIGKILL
+            logger.warning(
+                "Apptainer inner command ended by SIGKILL; using exit code %s", rc
+            )
         return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
 
     async def _kill_marked_processes(self) -> None:

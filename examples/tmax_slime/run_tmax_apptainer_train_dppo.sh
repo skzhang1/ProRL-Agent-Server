@@ -11,7 +11,7 @@ reference_recipe="${reference_recipe:-0}"
 polar_project_root="${polar_project_root:-${project_root}}"
 wandb_compat_dir="${script_dir}/tmp/wandb_compat"
 runtime_project_src="${polar_project_root}/src"
-if [ "${reference_recipe}" = "1" ]; then
+if [ "${reference_recipe}" = "1" ] && [ "${use_wandb:-1}" = "1" ]; then
     [ -f "${wandb_compat_dir}/sitecustomize.py" ] || { printf 'ERROR: missing W\&B compatibility shim: %s\n' "${wandb_compat_dir}/sitecustomize.py" >&2; exit 1; }
     runtime_project_src="${wandb_compat_dir}:${runtime_project_src}"
 fi
@@ -159,6 +159,7 @@ run_log_dir="$(abs_path "${run_log_dir:-${run_dir}/logs}")"
 rollout_save_dir="$(abs_path "${rollout_save_dir:-${run_dir}/rollout_results}")"
 load_debug_rollout_data="${load_debug_rollout_data:-}"
 load_debug_rollout_data_subsample="${load_debug_rollout_data_subsample:-}"
+debug_rollout_only="${debug_rollout_only:-0}"
 save_dir="$(abs_path "${save_dir:-${project_root}/tmp/ckpt/${run_id}}")"
 full_prompt_data="$(abs_path "${full_prompt_data:-${project_root}/tmp/tmax_minimal/tmax_ready_14601.jsonl}")"
 prompt_data="$(abs_path "${prompt_data:-${run_dir}/tmax_train.jsonl}")"
@@ -269,6 +270,7 @@ polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-192}"
 polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-96}"
 polar_runtime_memory_mb="${polar_runtime_memory_mb:-}"
 polar_task_timeout_seconds="${polar_task_timeout_seconds:-1200}"
+polar_max_steps="${polar_max_steps:-}"
 polar_task_timeout_from_metadata="${polar_task_timeout_from_metadata:-1}"
 polar_request_timeout="${polar_request_timeout:-1200}"
 polar_fully_async="${polar_fully_async:-0}"
@@ -307,8 +309,8 @@ sglang_router_base_url="${sglang_router_base_url:-http://${sglang_router_host}:$
 
 # Mirror the outer-launcher invariant inside the container.  This prevents a
 # direct invocation or inherited environment from sending training elsewhere.
-use_wandb=1
-wandb_mode=online
+use_wandb="${use_wandb:-1}"
+wandb_mode="${wandb_mode:-online}"
 wandb_entity=hwinf_dcm
 wandb_project=harnessgen
 wandb_group="${wandb_group:-tmax-${agent_label}-qwen35-4b-${run_label}}"
@@ -318,7 +320,7 @@ wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 wandb_dir="$(abs_path "${wandb_dir:-${project_root}/logs/wandb}")"
 
 if [ "${patch_container_runtime_only:-0}" != "1" ]; then
-    if [ "${train_num_gpus}" -le 0 ]; then
+    if [ "${train_num_gpus}" -le 0 ] && [ "${debug_rollout_only}" != "1" ]; then
         die "train_num_gpus must be positive"
     fi
     if [ -z "${load_debug_rollout_data}" ] && [ "${rollout_num_gpus}" -le 0 ]; then
@@ -486,7 +488,6 @@ patch_runtime() {
     else
         log "WARNING: optional Slime router token patch is unavailable: ${router_patch}"
     fi
-    SLIME_DIR="${slime_dir}" bash "${project_root}/scripts/patch/patch_slime_megatron_compat.sh"
     # Slime's primary W&B process currently ignores --wandb-run-id on its
     # first init. Honor the stable id so successive Slurm allocations resume
     # one logical experiment instead of creating disconnected runs.
@@ -947,6 +948,7 @@ render_runtime_configs() {
     export POLAR_EARLY_STOP_GRACE_SESSIONS="${polar_early_stop_grace_sessions}"
     export POLAR_MAX_TRAJECTORY_TOKENS="${polar_max_trajectory_tokens}"
     export POLAR_TASK_TIMEOUT_SECONDS="${polar_task_timeout_seconds}"
+    export POLAR_MAX_STEPS="${polar_max_steps}"
     export POLAR_TASK_TIMEOUT_FROM_METADATA="${polar_task_timeout_from_metadata}"
     export POLAR_RUNTIME_MEMORY_MB="${polar_runtime_memory_mb}"
     export POLAR_MULTI_GATEWAY="${polar_multi_gateway}"
@@ -1053,6 +1055,9 @@ if os.environ.get("POLAR_TASK_TIMEOUT_FROM_METADATA", "0") == "1":
     task["timeout_seconds"] = "{sample.metadata.timeout_seconds}"
 else:
     task["timeout_seconds"] = int(os.environ["POLAR_TASK_TIMEOUT_SECONDS"])
+max_steps = os.environ.get("POLAR_MAX_STEPS", "").strip()
+if max_steps:
+    task["max_steps"] = int(max_steps)
 runtime = task.setdefault("runtime", {})
 memory_mb = os.environ.get("POLAR_RUNTIME_MEMORY_MB", "").strip()
 if memory_mb:
@@ -1220,7 +1225,9 @@ service_pids=()
 
 gateway_rank_allowed() {
     if [ "${polar_multi_gateway}" = "1" ]; then
-        local rank="${SLURM_NODEID:-${SLURM_PROCID:-${RAY_NODE_RANK:-0}}}"
+        # Single-node srun steps renumber SLURM_NODEID/SLURM_PROCID to 0.
+        # RAY_NODE_RANK is the explicit allocation-wide rank from the submitter.
+        local rank="${RAY_NODE_RANK:-${SLURM_NODEID:-${SLURM_PROCID:-0}}}"
         case "${rank}" in
             ''|*[!0-9]*) die "invalid gateway rank: ${rank}" ;;
         esac
@@ -1238,7 +1245,7 @@ gateway_rank_allowed() {
 
 gateway_node_id() {
     if [ "${polar_multi_gateway}" = "1" ]; then
-        local rank="${SLURM_NODEID:-${SLURM_PROCID:-${RAY_NODE_RANK:-0}}}"
+        local rank="${RAY_NODE_RANK:-${SLURM_NODEID:-${SLURM_PROCID:-0}}}"
         gateway_rank_allowed || die "rank ${rank} is not configured as a Polar gateway rank (${polar_gateway_ranks:-unset})"
         printf 'slurm-rank-%s\n' "${rank}"
     else
@@ -1684,6 +1691,9 @@ PY
     if [ -n "${fetch_trajectory_retry_times:-}" ]; then
         train_args+=(--fetch-trajectory-retry-times "${fetch_trajectory_retry_times}")
     fi
+    if [ "${debug_rollout_only}" = "1" ]; then
+        train_args+=(--debug-rollout-only)
+    fi
 
     log "Launching Slime train_async.py"
     set +e
@@ -1747,6 +1757,7 @@ if [ "${pi_multigw_sidecar:-0}" = "1" ]; then
 fi
 
 ensure_current_checkouts
+SLIME_DIR="${slime_dir}" bash "${project_root}/scripts/patch/patch_slime_megatron_compat.sh"
 if [ "${reference_recipe}" = "1" ]; then
     patch_container_runtime
 else

@@ -90,24 +90,36 @@ class BaseRuntime(ABC):
 
     @staticmethod
     async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
-        """SIGKILL a command and every descendant still in its POSIX group."""
-        # Kill first: scanning /proc here can delay cancellation under load.
-        logger.warning("runtime killpg active pid=%s pgid=%s", process.pid, process.pid)
+        """Stop a command and every descendant still in its POSIX group."""
+        logger.info("runtime SIGTERM group pid=%s pgid=%s", process.pid, process.pid)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except (AttributeError, PermissionError):
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return
+
+        # PI normally exits immediately on SIGTERM. Keep SIGKILL only as the
+        # bounded fallback for a stuck command.
+        for _ in range(50):
+            if process.returncode is not None:
+                return
+            await asyncio.sleep(0.1)
+
+        logger.warning("runtime SIGKILL group pid=%s pgid=%s", process.pid, process.pid)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except (AttributeError, PermissionError):
-            # Preserve the old best-effort behavior on non-POSIX platforms or
-            # if a launcher unexpectedly changes process-group ownership.
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-        try:
-            await process.wait()
-        except ProcessLookupError:
-            pass
+        await process.wait()
 
     async def _kill_tracked_process_groups(self) -> None:
         """Remove background children left by completed local commands."""

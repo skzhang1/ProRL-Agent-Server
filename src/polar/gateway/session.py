@@ -234,14 +234,21 @@ def resolve_session_id(
         or clean_session_id(query_session_id)
         or clean_session_id(body.get("_proxy_session_id"))
     )
+    api_key = extract_api_key(headers)
     if explicit_session_id:
-        if registry.get(explicit_session_id) is None:
-            registry.register(explicit_session_id)
-        else:
+        if registry.get(explicit_session_id) is not None:
             registry.update_activity(explicit_session_id)
+            return explicit_session_id
+
+        # Child agents such as OpenCode add their own X-Session-ID while
+        # inheriting the registered parent session as their API key.
+        if api_key and registry.get(api_key) is not None:
+            registry.update_activity(api_key)
+            return api_key
+
+        registry.register(explicit_session_id)
         return explicit_session_id
 
-    api_key = extract_api_key(headers)
     if api_key and registry.get(api_key) is not None:
         registry.update_activity(api_key)
         return api_key

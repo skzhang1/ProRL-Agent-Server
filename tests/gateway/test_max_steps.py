@@ -31,22 +31,22 @@ def test_task_request_validates_max_steps() -> None:
         )
 
 
-def test_dispatcher_stops_only_active_exec_at_max_steps() -> None:
+def test_dispatcher_stops_entire_runtime_at_max_steps() -> None:
     async def run() -> None:
         dispatcher = SessionDispatcher(
             max_init_workers=1,
             max_run_workers=1,
             max_postrun_workers=1,
         )
-        runtime = SimpleNamespace(cancel_active_exec=AsyncMock())
+        runtime = SimpleNamespace(cancel=AsyncMock())
         managed = SimpleNamespace(runtime=runtime, max_steps_reached=None)
         dispatcher._sessions["session-1"] = managed
 
         assert await dispatcher.stop_for_max_steps("session-1", 160)
         assert managed.max_steps_reached == 160
-        runtime.cancel_active_exec.assert_awaited_once_with()
+        runtime.cancel.assert_awaited_once_with()
         assert not (await dispatcher.stop_for_max_steps("session-1", 160))
-        runtime.cancel_active_exec.assert_awaited_once_with()
+        runtime.cancel.assert_awaited_once_with()
 
     asyncio.run(run())
 

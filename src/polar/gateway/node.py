@@ -418,6 +418,9 @@ class GatewayNodeManager:
                     },
                 )
             if result.return_code == -1:
+                # A timeout must also remove processes that detached from the
+                # Apptainer exec launcher's process group.
+                await runtime.cancel()
                 return AgentRunResult(
                     status="timeout",
                     return_code=-1,

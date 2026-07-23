@@ -7,7 +7,7 @@ import shlex
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec
-from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR
+from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
 from polar.runtime.models import ExecInput
 
 
@@ -56,6 +56,8 @@ class PiHarness(BaseHarness):
             "providers": {
                 provider: {
                     "baseUrl": "__POLAR_GATEWAY_BASE_URL__",
+                    "apiKey": "OPENAI_API_KEY",
+                    "headers": {"X-Session-ID": "OPENAI_API_KEY"},
                     "compat": compat,
                     "models": [
                         {
@@ -81,19 +83,26 @@ class PiHarness(BaseHarness):
         return [
             ExecInput(
                 command=(
-                    f"mkdir -p {self._AGENT_DIR} && "
+                    f"mkdir -p {self._AGENT_DIR} {RUNTIME_SESSION_DIR}/tmp && "
                     # $OPENAI_BASE_URL is substituted at exec time; the
                     # placeholder keeps the JSON static (no shell quoting fun).
                     f"printf '%s' {shlex.quote(config_json)} "
                     f'| sed "s|__POLAR_GATEWAY_BASE_URL__|$OPENAI_BASE_URL|g" '
                     f"> {self._AGENT_DIR}/models.json && "
-                    f"pi --print --mode json --no-session "
+                    # Print mode emits only the final answer. JSON mode emits
+                    # every partial tool event and made the gateway buffer
+                    # unbounded stdout during long bash calls.
+                    f"pi --print --no-session "
                     f"--provider {shlex.quote(provider)} "
                     f"--model {shlex.quote(model_id)}"
                     f"{flags_str} "
                     f"{shlex.quote(instruction)} "
-                    f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/pi.txt"
+                    f"> {RUNTIME_AGENT_LOG_DIR}/pi.txt 2>&1"
                 ),
-                env={**self.env, "PI_OFFLINE": "1"},
+                env={
+                    **self.env,
+                    "PI_OFFLINE": "1",
+                    "TMPDIR": f"{RUNTIME_SESSION_DIR}/tmp",
+                },
             ),
         ]

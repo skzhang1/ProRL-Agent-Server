@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from polar.gateway.detection import APIType, detect, extract_model
+from polar.gateway.session import SessionRegistry, resolve_session_id
 
 
 def test_detect_prefers_path_over_body_shape() -> None:
@@ -28,3 +29,37 @@ def test_extract_model_defaults_by_api_family() -> None:
     assert extract_model(APIType.OPENAI_CHAT, {"model": "requested-model"}) == "requested-model"
     assert extract_model(APIType.GOOGLE, {}) == "gemini-pro"
     assert extract_model(APIType.ANTHROPIC, {}) == "unknown"
+
+
+def test_unknown_child_session_header_uses_registered_api_key() -> None:
+    registry = SessionRegistry()
+    registry.register("sk-polar-parent", registered=True)
+
+    session_id = resolve_session_id(
+        registry,
+        {
+            "Authorization": "Bearer sk-polar-parent",
+            "X-Session-ID": "ses-child",
+        },
+        {},
+    )
+
+    assert session_id == "sk-polar-parent"
+    assert registry.get("ses-child") is None
+
+
+def test_registered_explicit_session_still_wins() -> None:
+    registry = SessionRegistry()
+    registry.register("sk-polar-parent", registered=True)
+    registry.register("ses-child", registered=True)
+
+    session_id = resolve_session_id(
+        registry,
+        {
+            "Authorization": "Bearer sk-polar-parent",
+            "X-Session-ID": "ses-child",
+        },
+        {},
+    )
+
+    assert session_id == "ses-child"
