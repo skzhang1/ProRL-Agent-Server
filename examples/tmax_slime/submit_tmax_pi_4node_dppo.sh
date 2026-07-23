@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tmax-pi-4b-dppo-4n
 #SBATCH --account=nvr_lpr_agentic
-#SBATCH --reservation=sla_res_fw190_d580
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
@@ -200,8 +199,6 @@ die() {
 }
 
 [ "${SLURM_JOB_NUM_NODES:-0}" = "4" ] || die "this script requires exactly four allocated nodes"
-[ "${SLURM_JOB_RESERVATION:-}" = "sla_res_fw190_d580" ] || \
-    die "this job must run on reservation sla_res_fw190_d580"
 job_account="${SLURM_JOB_ACCOUNT:-}"
 if [ -z "${job_account}" ]; then
     job_account="$(scontrol show job -o "${SLURM_JOB_ID}" | sed -n 's/.* Account=\([^ ]*\).*/\1/p')"
@@ -563,6 +560,14 @@ monitor_pid="$!"
 mem_monitor_pid="$!"
 
 if [ "${rank}" = "0" ]; then
+    (
+        cd "${slime_dir}"
+        /opt/polr_venv/bin/python -m pytest -q \
+            tests/test_train_async_checkpoint_order.py \
+            tests/test_train_metric_commit.py \
+            tests/test_update_weight_timing.py
+    ) >"${run_log_dir}/slime-checkpoint-order-tests.log" 2>&1
+
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
         --dashboard-host=0.0.0.0 --dashboard-port="${ray_dashboard_port}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
@@ -713,5 +718,3 @@ kill "${batch_monitor_pid}" 2>/dev/null || true
 wait "${batch_monitor_pid}" 2>/dev/null || true
 printf '[%s] main srun exited rc=%s\n' "$(date -u +%FT%TZ)" "${srun_rc}" >>"${batch_monitor_log}"
 exit "${srun_rc}"
-
-
