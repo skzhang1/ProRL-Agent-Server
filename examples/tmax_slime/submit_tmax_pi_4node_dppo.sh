@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tmax-pi-4b-dppo-4n
+#SBATCH --job-name=tmax-pi-4b-dppo-s16-500
 #SBATCH --account=nvr_lpr_agentic
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
@@ -61,14 +61,14 @@ qkv_format="${qkv_format:-thd}"
 use_dynamic_batch_size=1
 use_sequence_parallel=1
 micro_batch_size=1
-global_batch_size=256
+global_batch_size=128
 load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
 rollout_batch_size=8
-n_samples_per_prompt=32
+n_samples_per_prompt=16
 num_epoch=1
-# Slime uses an exclusive boundary: rollout IDs 0..19 are 20 training steps.
-target_num_rollout=20
+# Slime uses an exclusive boundary: rollout IDs 0..499 are 500 training steps.
+target_num_rollout=500
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
@@ -81,7 +81,7 @@ exit_duration_minutes=160
 # Compact PI history before the 60k inference limit, then prefix-merge within
 # each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
 max_tokens_per_gpu=67584
-log_probs_chunk_size=256
+log_probs_chunk_size=64
 rollout_max_response_len=16384
 rollout_max_prompt_len=32000
 sglang_context_length=262144
@@ -103,11 +103,11 @@ max_train_rollout_logprob_abs_diff=0.5
 # The initial 4B PI policy often yields all-zero/all-one groups. Slime's
 # nonzero-std filter retries without a bound, which can leave the actor idle
 # long enough for the cluster reaper to cancel the allocation. Keep all eight
-# 32-sample groups instead: reward centering gives constant-reward groups zero
+# 16-sample groups instead: reward centering gives constant-reward groups zero
 # advantage, while mixed-reward groups retain their training signal.
 dynamic_sampling_filter_path=""
 polar_fully_async=1
-polar_early_stop_grace_sessions=2
+polar_early_stop_grace_sessions=4
 polar_max_trajectory_tokens=67584
 
 # PI/Polar settings.
@@ -151,13 +151,13 @@ rollout_health_check_timeout=30
 rollout_health_check_first_wait=0
 
 # Fixed identity: this task cannot inherit an older experiment name or save path.
-run_label="dppo-4n-rb8-s32-v3"
-experiment_name="tmax_pi_4b_dppo_4n_rb8_s32_v3"
+run_label="dppo-4n-rb8-s16-500step-v1"
+experiment_name="tmax_pi_4b_dppo_4n_rb8_s16_500step_v1"
 run_id="${experiment_name}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
-run_generation="20260723-dppo-4n-rb8-s32-v3"
+run_generation="20260724-dppo-4n-rb8-s16-500step-v1"
 rollout_save_dir="${run_dir}/rollout_results"
 full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_ready_prefix256.jsonl"
 prompt_data="${run_dir}/tmax_train.jsonl"
@@ -239,9 +239,9 @@ expected_manifest="run_generation=${run_generation}
 project_root=${project_root}
 slime_dir=${slime_dir}
 rollout_batch_size=8
-n_samples_per_prompt=32
-global_batch_size=256
-target_num_rollout=20
+n_samples_per_prompt=16
+global_batch_size=128
+target_num_rollout=500
 dynamic_sampling_filter=off
 session_timeout_seconds=900
 "
@@ -655,7 +655,7 @@ chmod +x "${worker_script}"
 
 cat <<SUMMARY
 ============================================================
-TMax PI 4B DPPO - fresh 20-step qualification
+TMax PI 4B DPPO - fresh 500-step training
   run:       ${run_id}
   nodes:     ${slurm_nodes[*]}
   ray head:  ${ray_head_ip}
