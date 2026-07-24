@@ -273,6 +273,12 @@ def _scheduler_metadata(result: "SessionResult", trace: "Trace | None") -> dict[
 
 def _sample_status(Sample: Any, result: "SessionResult", trace: "Trace") -> Any:
     trajectory_status = result.trajectory.status
+    result_metadata = getattr(result, "metadata", {}) or {}
+    if (
+        result.status == "TIMEOUT"
+        and result_metadata.get("termination_reason") == "max_steps"
+    ):
+        return Sample.Status.TRUNCATED
     if trajectory_status == "TIMEOUT" or result.status == "TIMEOUT":
         return Sample.Status.ABORTED
     if trajectory_status == "ERROR" or result.status == "ERROR" or result.error or result.trajectory.error:

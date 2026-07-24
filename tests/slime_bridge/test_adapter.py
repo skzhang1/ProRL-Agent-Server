@@ -180,3 +180,54 @@ def test_session_result_to_samples_requires_logprobs_for_trainable_tokens(monkey
             group_index=1,
             trajectory_index=2,
         )
+
+
+def test_session_result_to_samples_keeps_controlled_max_steps_trainable(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    trace = Trace(
+        prompt_ids=[1],
+        response_ids=[2, 3],
+        loss_mask=[1, 1],
+        response_logprobs=[-0.1, -0.2],
+        reward=0.0,
+    )
+    result = _session_result(trace=trace, status=SessionStatus.TIMEOUT)
+    result.metadata["termination_reason"] = "max_steps"
+    result.metadata["max_steps"] = 160
+    result.error = "session reached max_steps=160"
+
+    samples = session_result_to_samples(
+        result,
+        group_index=1,
+        trajectory_index=2,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].status == FakeSample.Status.TRUNCATED
+    assert samples[0].loss_mask == [1, 1]
+    assert samples[0].rollout_log_probs == [-0.1, -0.2]
+    assert samples[0].remove_sample is False
+
+
+def test_session_result_to_samples_still_masks_execution_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    trace = Trace(
+        prompt_ids=[1],
+        response_ids=[2, 3],
+        loss_mask=[1, 1],
+        response_logprobs=[-0.1, -0.2],
+        reward=0.0,
+    )
+    result = _session_result(trace=trace, status=SessionStatus.TIMEOUT)
+    result.metadata["termination_reason"] = "session_timeout"
+    result.error = "session execution timeout"
+
+    samples = session_result_to_samples(
+        result,
+        group_index=1,
+        trajectory_index=2,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].status == FakeSample.Status.ABORTED
+    assert samples[0].loss_mask == [0, 0]
