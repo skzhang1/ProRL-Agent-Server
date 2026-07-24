@@ -81,7 +81,7 @@ exit_duration_minutes=160
 # Compact PI history before the 60k inference limit, then prefix-merge within
 # each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
 max_tokens_per_gpu=67584
-log_probs_chunk_size=64
+log_probs_chunk_size=256
 rollout_max_response_len=16384
 rollout_max_prompt_len=32000
 sglang_context_length=262144
