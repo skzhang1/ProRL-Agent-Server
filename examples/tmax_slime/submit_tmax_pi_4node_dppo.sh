@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tmax-pi-4b-dppo-s16-500
-#SBATCH --account=nvr_lpr_agentic
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
@@ -24,6 +23,11 @@
 # rollout engines on the other three nodes, with one gateway per rollout node.
 set -euo pipefail
 
+##############################################################################################
+# Configuration
+##############################################################################################
+
+# Project paths and container runtime.
 project_root="${project_root:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server}"
 script_dir="${project_root}/examples/tmax_slime"
 inner_launcher="${script_dir}/run_tmax_apptainer_train_dppo.sh"
@@ -44,6 +48,10 @@ reference_recipe=1
 polar_project_root="${polar_project_root:-${project_root}}"
 hf_checkpoint="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/model/Qwen3.5-4B"
 ref_load="${project_root}/tmp/checkpoints/Qwen3.5-4B_torch_dist"
+
+##############################################################################################
+# GPU Topology and Training Batch
+##############################################################################################
 
 # One training node and three rollout nodes. The actor uses TP=4/DP=2.
 gpus_per_node=8
@@ -78,6 +86,10 @@ smoke_rows="${smoke_rows:-0}"
 # the four-hour Slurm allocation.
 exit_duration_minutes=160
 
+##############################################################################################
+# Model and DPPO Settings
+##############################################################################################
+
 # Compact PI history before the 60k inference limit, then prefix-merge within
 # each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
 max_tokens_per_gpu=67584
@@ -109,6 +121,10 @@ dynamic_sampling_filter_path=""
 polar_fully_async=1
 polar_early_stop_grace_sessions=4
 polar_max_trajectory_tokens=67584
+
+##############################################################################################
+# PI and Polar Settings
+##############################################################################################
 
 # PI/Polar settings.
 agent_harness=pi
@@ -150,6 +166,10 @@ rollout_health_check_interval=30
 rollout_health_check_timeout=30
 rollout_health_check_first_wait=0
 
+##############################################################################################
+# Experiment and Logging
+##############################################################################################
+
 # Fixed identity: this task cannot inherit an older experiment name or save path.
 run_label="dppo-4n-rb8-s16-500step-v1"
 experiment_name="tmax_pi_4b_dppo_4n_rb8_s16_500step_v1"
@@ -177,6 +197,11 @@ wandb_random_suffix=0
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 
 dry_run=0
+
+##############################################################################################
+# Network and Ray Settings
+##############################################################################################
+
 # Host networking can expose stale Polar listeners from an earlier allocation.
 # Give each Slurm job its own control-plane ports instead of fixed 18080/18100.
 port_slot=$((SLURM_JOB_ID % 1000))
@@ -193,20 +218,17 @@ ray_cluster_timeout_seconds=600
 ray_memory_usage_threshold="${ray_memory_usage_threshold:-0.99}"
 ray_memory_monitor_refresh_ms="${ray_memory_monitor_refresh_ms:-}"
 
+##############################################################################################
+# Validation
+##############################################################################################
+
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
 [ "${SLURM_JOB_NUM_NODES:-0}" = "4" ] || die "this script requires exactly four allocated nodes"
-job_account="${SLURM_JOB_ACCOUNT:-}"
-if [ -z "${job_account}" ]; then
-    job_account="$(scontrol show job -o "${SLURM_JOB_ID}" | sed -n 's/.* Account=\([^ ]*\).*/\1/p')"
-fi
-case "${job_account}" in
-    nvr_lpr_agentic) ;;
-    *) die "account ${job_account:-unknown} is not allowed; use nvr_lpr_agentic" ;;
-esac
+job_account="${SLURM_JOB_ACCOUNT:-default}"
 [ -x "${inner_launcher}" ] || die "missing inner launcher: ${inner_launcher}"
 [ -f "${train_sqsh}" ] || die "missing training image: ${train_sqsh}"
 [ -s "${full_prompt_data}" ] || die "missing pre-generated TMax prompt pool: ${full_prompt_data}"
@@ -232,6 +254,9 @@ esac
 [ "${target_num_rollout}" -ge 1 ] || die "target_num_rollout must be a positive integer"
 [ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
 
+##############################################################################################
+# Resume Checkpoint
+##############################################################################################
 # This run may resume only checkpoints created by this exact training task.
 # A directory from any older experiment is rejected before Ray starts.
 run_manifest="${save_dir}/run_generation.txt"
@@ -298,6 +323,10 @@ fi
 start_rollout_id="${completed_rollouts}"
 num_rollout="${target_num_rollout}"
 
+##############################################################################################
+# W&B Authentication
+##############################################################################################
+
 # Keep credentials out of source and process command lines. Before Pyxis
 # starts, read the submit host's private netrc and forward only the environment
 # value into the container.
@@ -320,6 +349,10 @@ printf 'Polar per-session timeout: %ss; max steps: %s\n' \
 stop_file="${run_dir}/ray_workers.stop"
 worker_script="${run_dir}/ray_cluster_rank.sh"
 rm -f "${stop_file}"
+
+##############################################################################################
+# Cluster Topology
+##############################################################################################
 
 mapfile -t slurm_nodes < <(scontrol show hostnames "${SLURM_NODELIST}")
 [ "${#slurm_nodes[@]}" -eq 4 ] || die "expected four Slurm hosts"
@@ -387,6 +420,10 @@ elif [ -z "${polar_gateway_ranks}" ]; then
     polar_gateway_ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
 fi
 
+##############################################################################################
+# Runtime Environment
+##############################################################################################
+
 # Lower-case variables are the inner launcher's public settings.
 export project_root script_dir inner_launcher train_sqsh container_mounts slime_dir megatron_dir hf_checkpoint ref_load
 export reference_recipe polar_project_root
@@ -418,9 +455,17 @@ export dry_run ray_port ray_dashboard_port ray_num_cpus ray_expected_num_gpus ra
 export ray_memory_usage_threshold ray_memory_monitor_refresh_ms
 export ray_head_ip sglang_router_host stop_file
 
+##############################################################################################
+# Worker Script
+##############################################################################################
+
 cat >"${worker_script}" <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
+
+##############################################################################################
+# Worker Identity and Local Runtime
+##############################################################################################
 
 rank="${SLURM_PROCID}"
 node="$(hostname)"
@@ -483,6 +528,10 @@ PY
 # patches on every rank. Shared Slime/Megatron patches remain in the head path.
 patch_container_runtime_only=1 bash "${inner_launcher}" \
     >"${run_log_dir}/container-patch-rank-${rank}.log" 2>&1
+
+##############################################################################################
+# Worker Cleanup and Diagnostics
+##############################################################################################
 
 ray stop --force >/dev/null 2>&1 || true
 monitor_pid=""
@@ -558,6 +607,10 @@ monitor_pid="$!"
     done
 ) >>"${run_log_dir}/mem-rank-${rank}.log" 2>&1 &
 mem_monitor_pid="$!"
+
+##############################################################################################
+# Ray Cluster and Training
+##############################################################################################
 
 if [ "${rank}" = "0" ]; then
     (
@@ -653,6 +706,10 @@ fi
 WORKER
 chmod +x "${worker_script}"
 
+##############################################################################################
+# Launch Summary
+##############################################################################################
+
 cat <<SUMMARY
 ============================================================
 TMax PI 4B DPPO - fresh 500-step training
@@ -674,6 +731,10 @@ TMax PI 4B DPPO - fresh 500-step training
   W&B:       ${wandb_entity}/${wandb_project}/${wandb_run_id}
 ============================================================
 SUMMARY
+
+##############################################################################################
+# Slurm Job Step
+##############################################################################################
 
 batch_monitor_log="${run_log_dir}/batch-step-monitor.log"
 set +e
