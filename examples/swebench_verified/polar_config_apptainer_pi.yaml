@@ -1,0 +1,99 @@
+# Current Polar bridge configuration for PI SWE-bench Verified eval-only runs.
+# The launcher renders polar_agent_cli_dir and polar_apptainer_image_dir to
+# absolute paths under the current eval checkout.
+
+polar_rollout_url: "http://127.0.0.1:18080"
+polar_gateway_url: "http://127.0.0.1:18100"
+polar_reward_key: "score"
+polar_max_async_level: 4
+polar_request_timeout: 3900
+polar_callback_host: "127.0.0.1"
+polar_min_complete_accept_fraction: 0.0
+polar_eval_dataset_name: "swebench_verified"
+polar_agent_cli_dir: "tmp/swegym_agent_cli/opt_node"
+polar_apptainer_image_dir: "tmp/swebench_verified/apptainer_images"
+polar_instruction_template: "{instruction}"
+
+polar_task_template:
+  timeout_seconds: 3600
+  runtime:
+    backend: "apptainer"
+    image: "{args.polar_apptainer_image_dir}/{sample.metadata.instance_id}.sif"
+    network: "host"
+    workdir: "/polar/session/workspace"
+    env:
+      HOME: "/polar/session/home"
+      PATH: "/polar/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    kwargs:
+      volumes:
+        - "{args.polar_agent_cli_dir}:/opt/node:ro"
+    prepare:
+      - type: exec
+        cwd: "/"
+        command: >-
+          mkdir -p "$HOME/.pi/agent" &&
+          printf '%s' 'eyJjb21wYWN0aW9uIjp7ImVuYWJsZWQiOnRydWV9LCJyZXRyeSI6eyJlbmFibGVkIjp0cnVlLCJtYXhSZXRyaWVzIjowLCJwcm92aWRlciI6eyJtYXhSZXRyaWVzIjowfX19' | base64 -d > "$HOME/.pi/agent/settings.json"
+      - type: exec
+        cwd: "/"
+        command: >-
+          rm -rf /polar/session/workspace &&
+          mkdir -p /polar/session/logs/agent /polar/session/workspace "$HOME/.venv/bin" &&
+          cp -a /testbed/. /polar/session/workspace/ &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+          git config --global core.pager '' &&
+          cd /polar/session/workspace &&
+          (git reset --hard || true)
+    eval_prepare:
+      - type: exec
+        cwd: "/"
+        command: >-
+          mkdir -p /polar/session/logs/agent "$HOME/.venv/bin" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+          git config --global core.pager ''
+  agent:
+    harness: "pi"
+    model_name: "Qwen/Qwen3.5-4B"
+    settings:
+      api_type: "openai-completions"
+      context_window: 24000
+      max_tokens: 512
+      compat:
+        maxTokensField: "max_tokens"
+    env: {}
+  builder:
+    strategy: "prefix_merging"
+  evaluator:
+    strategy: "swebench_harness"
+    refresh_runtime: true
+    config:
+      repo_dir: "/testbed"
+      patch_command: "cd /polar/session/workspace && git add -A && git diff --cached --binary"
+      instance: "{sample.metadata.instance}"
+      exclude_patterns:
+        - "trajectories/**"
+        - "**/trajectories/**"
+        - "node_modules/**"
+        - "**/node_modules/**"
+        - ".cache/**"
+        - "**/.cache/**"
+        - ".venv/**"
+        - "**/.venv/**"
+        - ".claude/**"
+        - "**/.claude/**"
+        - ".codex/**"
+        - "**/.codex/**"
+        - ".gemini/**"
+        - "**/.gemini/**"
+        - ".opencode/**"
+        - "**/.opencode/**"
+        - ".config/opencode/**"
+        - ".pi/**"
+        - "**/.pi/**"
+        - ".qwen/**"
+        - "**/.qwen/**"
+        - "$HOME/**"
+        - "**/$HOME/**"
+
+polar_task_id_template: "polar-swebench-verified-{sample.metadata.instance_id}-{rollout_id}-{sample.group_index}"

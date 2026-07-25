@@ -123,3 +123,6 @@ web/node_modules/
 web/dist/
 
 hao_example/
+examples/tmax_slime/tmax_pi_2node_300_agent_traces.json
+examples/tmax_slime/rollout_gateway_sweep_8x16.md
+examples/swebench_verified/results/
