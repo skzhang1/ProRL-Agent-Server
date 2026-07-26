@@ -49,6 +49,11 @@ def instance_id_from_row(row: dict[str, Any]) -> str:
     raise SystemExit(f"manifest row missing instance id: keys={sorted(row)}")
 
 
+def repository_from_instance_id(instance_id: str) -> str:
+    """Return the SWE-bench repository namespace (for example, django)."""
+    return instance_id.split("__", 1)[0]
+
+
 def dataset_index_from_row(row: dict[str, Any], fallback: int) -> int:
     metadata = row.get("metadata") or {}
     try:
@@ -244,6 +249,7 @@ def main() -> int:
             {
                 "dataset_index": manifest_entry["dataset_index"],
                 "instance_id": iid,
+                "repository": repository_from_instance_id(iid),
                 "score": 1.0 if item["resolved"] else 0.0,
                 "session_count": len(paths),
                 "source_run_id": paths[0].relative_to(project_root / "examples" / "swebench_verified" / "results").parts[0] if paths else None,
@@ -276,6 +282,16 @@ def main() -> int:
         or (item["session_status"] not in {"COMPLETED", "MISSING"} and item["failure_kind"] != "TIMEOUT")
     )
     duplicates = sum(1 for item in results if item["session_count"] > 1)
+    repository_summary = {}
+    for item in results:
+        repo = item["repository"]
+        stats = repository_summary.setdefault(repo, {"total_tasks": 0, "resolved_tasks": 0})
+        stats["total_tasks"] += 1
+        stats["resolved_tasks"] += int(item["resolved"])
+    for stats in repository_summary.values():
+        stats["pass_at_1"] = stats["resolved_tasks"] / stats["total_tasks"]
+    repository_summary = dict(sorted(repository_summary.items()))
+
     validation_ok = (
         total == args.expected_total
         and len(observed_indices) == args.expected_total
@@ -292,6 +308,7 @@ def main() -> int:
         "clean_completed_tasks": clean_completed,
         "resolved_tasks": resolved,
         "pass_at_1": (resolved / total) if total else 0.0,
+        "by_repository": repository_summary,
         "timeout_tasks": timeouts,
         "error_tasks": errors,
         "missing_tasks": missing,
@@ -319,6 +336,7 @@ def main() -> int:
     fieldnames = [
         "dataset_index",
         "instance_id",
+        "repository",
         "score",
         "resolved",
         "failure_kind",

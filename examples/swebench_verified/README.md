@@ -1,9 +1,9 @@
 # SWE-bench Verified evaluation on NRT
 
-This directory contains the NRT/Apptainer evaluation path for PI + Qwen3.5-4B.
+This directory contains the NRT/Apptainer evaluation path for PI, Codex, Claude Code, and Qwen Code with Qwen3.5-4B.
 It evaluates the pre-training checkpoint and an arbitrary Megatron distributed
-checkpoint with the same Polar, PI, sampling, SGLang, and SWE-bench harness
-configuration.
+checkpoint with the same model-serving, sampling, SGLang, timeout, and SWE-bench
+configuration within each harness.
 
 The generic upstream Docker example files remain for reference. On NRT use
 `submit_swebench_pi_apptainer.sh`; it is restricted to the `interactive`
@@ -36,6 +36,32 @@ containing `latest_checkpointed_iteration.txt`. `--variants base` and
 `--variants checkpoint` run only one model. `--shard-size` defaults to 50 and
 `--array-concurrency` accepts only 1 or 2.
 
+## Non-PI harness matrix
+
+Use one global Slurm array for the three requested harnesses. Array concurrency is validated as 1 or 2, so the six model/harness cells can never collectively exceed two interactive nodes. Base and checkpoint shards are interleaved within each harness.
+
+```bash
+# Review only.
+bash examples/swebench_verified/submit_swebench_harness_matrix.sh plan \
+  --checkpoint /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/checkpoints/swe/iter_0000073
+
+# Six one-instance smoke tests (3 harnesses x 2 model variants).
+bash examples/swebench_verified/submit_swebench_harness_matrix.sh smoke \
+  --checkpoint /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/checkpoints/swe/iter_0000073
+
+# Full 6 x 500 strict pass-at-1 matrix.
+bash examples/swebench_verified/submit_swebench_harness_matrix.sh submit \
+  --checkpoint /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/checkpoints/swe/iter_0000073
+
+# Aggregate and compare checkpoint against base separately within each harness.
+bash examples/swebench_verified/submit_swebench_harness_matrix.sh aggregate \
+  --checkpoint /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/checkpoints/swe/iter_0000073
+```
+
+The full matrix defaults to 10 tasks per shard so four-way asynchronous execution remains inside the 3:55 Slurm walltime even when individual tasks approach the one-hour timeout; sharding does not change per-instance evaluation parameters.
+
+The matrix freezes the already installed CLIs rather than modifying shared software: Codex 0.145.0 (explicit version check, `xhigh` reasoning), Claude Code 2.1.217, and Qwen Code 0.20.1 (fixed 16k output limit via its documented `QWEN_CODE_MAX_OUTPUT_TOKENS` setting). The two model variants within a harness use the same CLI, Polar configuration, SIFs, sampling, SGLang limits, and timeouts. Harness-native turn and token policies differ across harnesses, so only the base-versus-checkpoint comparison within the same harness is treated as controlled. PI is not rerun by the matrix.
+
 ## Evaluation semantics
 
 - Dataset: all 500 SWE-bench Verified test instances.
@@ -65,8 +91,8 @@ All generated state is under `examples/swebench_verified/results/`:
 ## External read-only resources
 
 The launcher uses the current project checkout and its existing Slime/Megatron
-checkouts, the current training sqsh, the project-local patched Apptainer and PI
-CLI, the cached Verified JSON from the old eval directory, and the shared
+checkouts, the current training sqsh, the project-local patched Apptainer and shared agent
+CLIs, the cached Verified JSON from the old eval directory, and the shared
 `singularity_images_v3` SIF store. It does not modify Polar, Slime, Megatron,
 or any TMax file. `swebench_eval_hooks.py` uses Slime's documented custom
 eval-log hook so PI sessions without trainable token arrays do not trigger the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=swebench-pi-eval
+#SBATCH --job-name=swebench-harness-eval
 #SBATCH --account=nvr_lpr_agentic
 #SBATCH --partition=interactive
 #SBATCH --nodes=1
@@ -10,7 +10,7 @@
 #SBATCH --error=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/examples/swebench_verified/results/slurm/%x-%A_%a.err
 #SBATCH --export=ALL
 
-# Strict pass@1 SWE-bench Verified eval for PI scaffold + Qwen3.5-4B.
+# Strict pass@1 SWE-bench Verified eval for a Polar harness + Qwen3.5-4B.
 #
 # One script covers both requested variants:
 #   - base:  Qwen3.5-4B base Megatron checkpoint
@@ -63,6 +63,11 @@ while [ "$#" -gt 0 ]; do
             EVAL_VARIANTS="$2"
             shift 2
             ;;
+        --harness)
+            [ "$#" -ge 2 ] || { printf 'ERROR: --harness requires a value\n' >&2; exit 2; }
+            AGENT_HARNESS="$2"
+            shift 2
+            ;;
         *)
             printf 'ERROR: unknown argument: %s\n' "$1" >&2
             exit 2
@@ -77,11 +82,16 @@ ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-2}"
 RUN_GROUP="${RUN_GROUP:-swebench_verified_pi_qwen35_4b}"
 FINAL_AFTER_BASE="${FINAL_AFTER_BASE:-1}"
 EVAL_VARIANTS="${EVAL_VARIANTS:-base,checkpoint}"
+AGENT_HARNESS="${AGENT_HARNESS:-pi}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/checkpoints/swe/iter_0000073}"
 
 case "${ARRAY_CONCURRENCY}" in
     1|2) ;;
     *) printf 'ERROR: array concurrency must be 1 or 2 (interactive-node limit)\n' >&2; exit 2 ;;
+esac
+case "${AGENT_HARNESS}" in
+    pi|codex|claude_code|qwen_code) ;;
+    *) printf 'ERROR: unsupported harness: %s\n' "${AGENT_HARNESS}" >&2; exit 2 ;;
 esac
 CHECKPOINT_TAG="$(basename -- "${CHECKPOINT_PATH}")"
 CHECKPOINT_TAG="$(printf '%s' "${CHECKPOINT_TAG}" | tr -c 'A-Za-z0-9_.-' '_')"
@@ -97,10 +107,11 @@ print_login_plan() {
     shards="$(ceil_div "${TOTAL_DATASET_INSTANCES}" "${SHARD_SIZE}")"
     cat <<EOF
 =============================================
-SWE-bench Verified PI + Qwen3.5 evaluation plan
+SWE-bench Verified harness + Qwen3.5 evaluation plan
   Script:        ${BASH_SOURCE[0]}
   Project root:  ${PROJECT_ROOT_DEFAULT}
   Run group:     ${RUN_GROUP}
+  Harness:       ${AGENT_HARNESS}
   Variants:      ${EVAL_VARIANTS}  (base + final checkpoint by default)
   Dataset:       SWE-bench Verified test (${TOTAL_DATASET_INSTANCES} tasks)
   Shard size:    ${SHARD_SIZE} tasks -> ${shards} shard(s) per variant
@@ -124,7 +135,7 @@ submit_one_array() {
     local shards last_idx export_vars job_id
     shards="$(ceil_div "${TOTAL_DATASET_INSTANCES}" "${SHARD_SIZE}")"
     last_idx="$((shards - 1))"
-    export_vars="ALL,SCRIPT_MODE=run,MODEL_SOURCE=${variant},RUN_GROUP=${RUN_GROUP},SHARD_SIZE=${SHARD_SIZE},TOTAL_DATASET_INSTANCES=${TOTAL_DATASET_INSTANCES},CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+    export_vars="ALL,SCRIPT_MODE=run,MODEL_SOURCE=${variant},AGENT_HARNESS=${AGENT_HARNESS},RUN_GROUP=${RUN_GROUP},SHARD_SIZE=${SHARD_SIZE},TOTAL_DATASET_INSTANCES=${TOTAL_DATASET_INSTANCES},CHECKPOINT_PATH=${CHECKPOINT_PATH}"
     if [ -n "${dependency_arg}" ]; then
         job_id="$(sbatch --parsable --dependency="${dependency_arg}" --array="0-${last_idx}%${ARRAY_CONCURRENCY}" --export="${export_vars}" "${BASH_SOURCE[0]}")"
     else
@@ -145,7 +156,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
             base_job=""
             case ",${EVAL_VARIANTS}," in
                 *,base,*)
-                    base_job="$(sbatch --parsable --export="ALL,SCRIPT_MODE=run,MODEL_SOURCE=base,RUN_GROUP=${RUN_GROUP}_smoke,INSTANCE_RANGE=1-1,MAX_TASKS=-1,CHECKPOINT_PATH=${CHECKPOINT_PATH}" "${BASH_SOURCE[0]}")"
+                    base_job="$(sbatch --parsable --export="ALL,SCRIPT_MODE=run,MODEL_SOURCE=base,AGENT_HARNESS=${AGENT_HARNESS},RUN_GROUP=${RUN_GROUP}_smoke,INSTANCE_RANGE=1-1,MAX_TASKS=-1,CHECKPOINT_PATH=${CHECKPOINT_PATH}" "${BASH_SOURCE[0]}")"
                     printf 'Submitted base smoke: %s\n' "${base_job}"
                     ;;
             esac
@@ -155,7 +166,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
                     if [ "${FINAL_AFTER_BASE}" = "1" ] && [ -n "${base_job}" ]; then
                         dep="--dependency=afterany:${base_job}"
                     fi
-                    final_job="$(sbatch --parsable ${dep} --export="ALL,SCRIPT_MODE=run,MODEL_SOURCE=checkpoint,RUN_GROUP=${RUN_GROUP}_smoke,INSTANCE_RANGE=1-1,MAX_TASKS=-1,CHECKPOINT_PATH=${CHECKPOINT_PATH}" "${BASH_SOURCE[0]}")"
+                    final_job="$(sbatch --parsable ${dep} --export="ALL,SCRIPT_MODE=run,MODEL_SOURCE=checkpoint,AGENT_HARNESS=${AGENT_HARNESS},RUN_GROUP=${RUN_GROUP}_smoke,INSTANCE_RANGE=1-1,MAX_TASKS=-1,CHECKPOINT_PATH=${CHECKPOINT_PATH}" "${BASH_SOURCE[0]}")"
                     printf 'Submitted checkpoint smoke: %s\n' "${final_job}"
                     ;;
             esac
@@ -405,11 +416,18 @@ GATEWAY_MAX_WORKERS="${GATEWAY_MAX_WORKERS:-32}"
 POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-4}"
 POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-3900}"
 TASK_TIMEOUT_SECONDS="${TASK_TIMEOUT_SECONDS:-3600}"
+AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-${MODEL_NAME}}"
 PI_MODEL_NAME="${PI_MODEL_NAME:-openai/${MODEL_NAME}}"
 PI_API_TYPE="${PI_API_TYPE:-openai-completions}"
 PI_CONTEXT_WINDOW="${PI_CONTEXT_WINDOW:-24000}"
 PI_MAX_TOKENS="${PI_MAX_TOKENS:-512}"
 PI_THINKING="${PI_THINKING:-}"
+CODEX_VERSION="${CODEX_VERSION:-0.145.0}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
+CODEX_REASONING_SUMMARY="${CODEX_REASONING_SUMMARY:-}"
+CLAUDE_MAX_TURNS="${CLAUDE_MAX_TURNS:-}"
+CLAUDE_MAX_THINKING_TOKENS="${CLAUDE_MAX_THINKING_TOKENS:-}"
+QWEN_CODE_MAX_OUTPUT_TOKENS="${QWEN_CODE_MAX_OUTPUT_TOKENS:-16000}"
 POLAR_RUNTIME_MEMORY_MB="${POLAR_RUNTIME_MEMORY_MB:-}"
 POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-${PROJECT_ROOT}/tmp/apptainer-v1.5.2-pyxis-fix/bin/apptainer}"
 POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-0}"
@@ -457,7 +475,16 @@ preflight() {
     fi
     [ -f "${DATASET_CACHE}" ] || die "DATASET_CACHE not found: ${DATASET_CACHE}"
     [ -d "${SHARED_SIF_DIR}" ] || die "SHARED_SIF_DIR not found: ${SHARED_SIF_DIR}"
-    [ -x "${AGENT_CLI_DIR}/bin/pi" ] || die "PI CLI not found under AGENT_CLI_DIR: ${AGENT_CLI_DIR}"
+    [ -x "${AGENT_CLI_DIR}/bin/node" ] || die "Node.js not found under AGENT_CLI_DIR: ${AGENT_CLI_DIR}"
+    case "${AGENT_HARNESS}" in
+        pi) agent_bin="pi" ;;
+        codex) agent_bin="codex" ;;
+        claude_code) agent_bin="claude" ;;
+        qwen_code) agent_bin="qwen" ;;
+        *) die "unsupported harness: ${AGENT_HARNESS}" ;;
+    esac
+    [ -x "${AGENT_CLI_DIR}/bin/${agent_bin}" ] || \
+        die "${AGENT_HARNESS} CLI not found under AGENT_CLI_DIR: ${AGENT_CLI_DIR}/bin/${agent_bin}"
     [ -x "${POLAR_APPTAINER_BIN}" ] || die "patched Apptainer not found: ${POLAR_APPTAINER_BIN}"
     [ "${SLURM_JOB_PARTITION:-interactive}" = "interactive" ] || die "eval is restricted to the interactive partition"
     [ "${SLURM_JOB_NUM_NODES:-1}" -le 1 ] || die "each eval shard must use exactly one node"
@@ -614,15 +641,39 @@ if memory_mb:
 else:
     runtime.pop("memory_mb", None)
 agent = task.setdefault("agent", {})
-agent["harness"] = "pi"
-agent["model_name"] = os.environ["PI_MODEL_NAME"]
-settings = agent.setdefault("settings", {})
-settings["api_type"] = os.environ["PI_API_TYPE"]
-settings["context_window"] = int(os.environ["PI_CONTEXT_WINDOW"])
-settings["max_tokens"] = int(os.environ["PI_MAX_TOKENS"])
-if os.environ.get("PI_THINKING", ""):
-    settings["thinking"] = os.environ["PI_THINKING"]
-agent.setdefault("env", {})
+harness = os.environ["AGENT_HARNESS"]
+agent["harness"] = harness
+agent["env"] = {}
+if harness == "pi":
+    agent["model_name"] = os.environ["PI_MODEL_NAME"]
+    settings = agent.setdefault("settings", {})
+    settings["api_type"] = os.environ["PI_API_TYPE"]
+    settings["context_window"] = int(os.environ["PI_CONTEXT_WINDOW"])
+    settings["max_tokens"] = int(os.environ["PI_MAX_TOKENS"])
+    if os.environ.get("PI_THINKING", ""):
+        settings["thinking"] = os.environ["PI_THINKING"]
+else:
+    agent["model_name"] = os.environ["AGENT_MODEL_NAME"]
+    settings = {}
+    agent["settings"] = settings
+    runtime["prepare"] = [
+        step for step in runtime.get("prepare", [])
+        if ".pi/agent/settings.json" not in str(step.get("command", ""))
+    ]
+    if harness == "codex":
+        settings["version"] = os.environ["CODEX_VERSION"]
+        settings["reasoning_effort"] = os.environ["CODEX_REASONING_EFFORT"]
+        if os.environ.get("CODEX_REASONING_SUMMARY", ""):
+            settings["reasoning_summary"] = os.environ["CODEX_REASONING_SUMMARY"]
+    elif harness == "claude_code":
+        if os.environ.get("CLAUDE_MAX_TURNS", ""):
+            settings["max_turns"] = int(os.environ["CLAUDE_MAX_TURNS"])
+        if os.environ.get("CLAUDE_MAX_THINKING_TOKENS", ""):
+            settings["max_thinking_tokens"] = int(os.environ["CLAUDE_MAX_THINKING_TOKENS"])
+    elif harness == "qwen_code":
+        agent["env"]["QWEN_CODE_MAX_OUTPUT_TOKENS"] = os.environ["QWEN_CODE_MAX_OUTPUT_TOKENS"]
+    else:
+        raise SystemExit(f"unsupported harness: {harness}")
 
 Path(config_out).parent.mkdir(parents=True, exist_ok=True)
 with open(config_out, "w", encoding="utf-8") as handle:
@@ -1208,7 +1259,11 @@ export PATH="/opt/polr_venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/b
 export PYTHONPATH="${SCRIPT_DIR}:${PROJECT_ROOT}/src:${SLIME_DIR}:${MEGATRON_DIR}:${PYTHONPATH:-}"
 export ROLLOUT_PORT GATEWAY_PORT ROLLOUT_SAVE_DIR MODEL_NAME SGLANG_ROUTER_BASE_URL
 export GATEWAY_MAX_WORKERS POLAR_MAX_ASYNC_LEVEL POLAR_REQUEST_TIMEOUT TASK_TIMEOUT_SECONDS POLAR_RUNTIME_MEMORY_MB
-export AGENT_CLI_DIR SIF_DIR PI_MODEL_NAME PI_API_TYPE PI_CONTEXT_WINDOW PI_MAX_TOKENS PI_THINKING
+export AGENT_CLI_DIR SIF_DIR AGENT_HARNESS AGENT_MODEL_NAME
+export PI_MODEL_NAME PI_API_TYPE PI_CONTEXT_WINDOW PI_MAX_TOKENS PI_THINKING
+export CODEX_VERSION CODEX_REASONING_EFFORT CODEX_REASONING_SUMMARY
+export CLAUDE_MAX_TURNS CLAUDE_MAX_THINKING_TOKENS
+export QWEN_CODE_MAX_OUTPUT_TOKENS
 export APPTAINER_CACHEDIR APPTAINER_TMPDIR
 export POLAR_APPTAINER_BIN POLAR_APPTAINER_DIRECT_EXEC POLAR_APPTAINER_ISOLATE_PID
 HF_CACHE_ROOT="${HF_CACHE_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HG_Cache}"
@@ -1227,9 +1282,10 @@ prepare_eval_assets
 if [ "${REMAINING_TASKS}" -eq 0 ]; then
     cat <<EOF
 =============================================
-SWE-bench Verified PI strict eval
+SWE-bench Verified harness strict eval
   Run ID:        ${RUN_ID}
   Model source:  ${MODEL_SOURCE}
+  Harness:       ${AGENT_HARNESS}
   Instance range:${INSTANCE_RANGE:-all}
   Selected:      ${SELECTED_TASKS}
   Remaining:     0
@@ -1247,9 +1303,10 @@ write_runtime_env
 if [ "${PREPARE_ONLY}" = "1" ]; then
     cat <<EOF
 =============================================
-SWE-bench Verified PI strict eval prepare-only
+SWE-bench Verified harness strict eval prepare-only
   Run ID:        ${RUN_ID}
   Model source:  ${MODEL_SOURCE}
+  Harness:       ${AGENT_HARNESS}
   Instance range:${INSTANCE_RANGE:-all}
   Selected:      ${SELECTED_TASKS}
   Remaining:     ${REMAINING_TASKS}
@@ -1265,9 +1322,10 @@ fi
 
 cat <<EOF
 =============================================
-SWE-bench Verified PI strict eval
+SWE-bench Verified harness strict eval
   Run ID:        ${RUN_ID}
   Model source:  ${MODEL_SOURCE}
+  Harness:       ${AGENT_HARNESS}
   Instance range:${INSTANCE_RANGE:-all}
   Selected:      ${SELECTED_TASKS}
   Remaining:     ${REMAINING_TASKS}
@@ -1286,8 +1344,10 @@ SWE-bench Verified PI strict eval
   SIF dir:       ${SIF_DIR}
   Shared SIF dir:${SHARED_SIF_DIR}
   Agent CLI dir: ${AGENT_CLI_DIR}
-  PI model:      ${PI_MODEL_NAME}
-  PI budget:     context=${PI_CONTEXT_WINDOW}, max_tokens=${PI_MAX_TOKENS}, api=${PI_API_TYPE}
+  Agent model:    ${AGENT_MODEL_NAME}
+  PI settings:   model=${PI_MODEL_NAME}, context=${PI_CONTEXT_WINDOW}, max_tokens=${PI_MAX_TOKENS}, api=${PI_API_TYPE}
+  Codex settings:version=${CODEX_VERSION}, reasoning=${CODEX_REASONING_EFFORT}
+  Qwen settings: max_output_tokens=${QWEN_CODE_MAX_OUTPUT_TOKENS}
   Sandbox mem:   ${POLAR_RUNTIME_MEMORY_MB:-<none>} MB per command
   Run dir:       ${RUN_DIR}
   Rollout dir:   ${ROLLOUT_SAVE_DIR}

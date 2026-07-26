@@ -1,4 +1,4 @@
-# Current Polar bridge configuration for PI SWE-bench Verified eval-only runs.
+# Current Polar bridge configuration for SWE-bench Verified eval-only runs.
 # The launcher renders polar_agent_cli_dir and polar_apptainer_image_dir to
 # absolute paths under the current eval checkout.
 
