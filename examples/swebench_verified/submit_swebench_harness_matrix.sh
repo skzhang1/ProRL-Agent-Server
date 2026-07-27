@@ -39,7 +39,7 @@ IFS=, read -r -a HARNESSES <<<"${HARNESS_CSV}"
 case "${ARRAY_CONCURRENCY}" in 1|2) ;; *) printf 'ERROR: concurrency must be 1 or 2\n' >&2; exit 2 ;; esac
 [ "${SHARD_SIZE}" -gt 0 ] || { printf 'ERROR: shard size must be positive\n' >&2; exit 2; }
 SHARDS=$(( (TOTAL_DATASET_INSTANCES + SHARD_SIZE - 1) / SHARD_SIZE ))
-CHECKPOINT_TAG="$(basename -- "${CHECKPOINT_PATH}" | tr -c 'A-Za-z0-9_.-' '_')"
+CHECKPOINT_TAG="$(printf '%s' "$(basename -- "${CHECKPOINT_PATH}")" | tr -c 'A-Za-z0-9_.-' '_')"
 
 print_plan() {
     cat <<EOF
