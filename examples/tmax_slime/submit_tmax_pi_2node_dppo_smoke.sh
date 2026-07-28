@@ -552,6 +552,14 @@ monitor_pid="$!"
 mem_monitor_pid="$!"
 
 if [ "${rank}" = "0" ]; then
+    (
+        cd "${slime_dir}"
+        /opt/polr_venv/bin/python -m pytest -q \
+            tests/test_train_async_checkpoint_order.py \
+            tests/test_train_metric_commit.py \
+            tests/test_update_weight_timing.py
+    ) >"${run_log_dir}/slime-checkpoint-order-tests.log" 2>&1
+
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
         --dashboard-host=0.0.0.0 --dashboard-port="${ray_dashboard_port}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
