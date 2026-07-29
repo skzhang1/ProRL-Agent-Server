@@ -60,6 +60,33 @@ def test_resolve_polar_slime_config_requires_agent_template() -> None:
         resolve_polar_slime_config(_args(polar_task_template={}))
 
 
+def test_resolve_polar_slime_config_validates_harness_pool() -> None:
+    config = resolve_polar_slime_config(
+        _args(
+            polar_harness_pool=[
+                {"harness": "pi", "model_name": "openai/model"},
+                {"harness": "codex", "model_name": "model"},
+            ],
+            polar_harness_seed=17,
+        )
+    )
+
+    assert [spec["harness"] for spec in config.harness_pool] == ["pi", "codex"]
+    assert config.harness_seed == 17
+
+
+def test_resolve_polar_slime_config_rejects_duplicate_harnesses() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_polar_slime_config(
+            _args(
+                polar_harness_pool=[
+                    {"harness": "pi"},
+                    {"harness": "pi"},
+                ]
+            )
+        )
+
+
 def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> None:
     config = resolve_polar_slime_config(
         _args(polar_min_complete_accept_fraction=0.8)
@@ -100,6 +127,66 @@ def test_render_task_payload_resolves_args_and_sample_placeholders() -> None:
     assert payload["agent"]["model_name"] == "openai/gpt-test"
     assert payload["runtime"]["image"] == "runtime:latest"
     assert payload["metadata"]["instance"] == "abc123"
+
+
+def test_render_task_payload_samples_one_harness_per_prompt_deterministically() -> None:
+    args = _args(
+        polar_harness_pool=[
+            {"harness": "pi", "model_name": "openai/model"},
+            {"harness": "codex", "model_name": "model"},
+            {"harness": "claude_code", "model_name": "model"},
+            {"harness": "qwen_code", "model_name": "model"},
+        ],
+        polar_harness_seed=0,
+    )
+    config = resolve_polar_slime_config(args)
+
+    def render(group_index: int) -> dict:
+        return render_task_payload(
+            args=args,
+            config=config,
+            sample=SimpleNamespace(
+                prompt="prompt",
+                metadata={"image": "runtime:latest", "instance_id": "abc123"},
+                group_index=group_index,
+            ),
+            instruction="Fix the bug",
+            rollout_id=2,
+            task_position=0,
+            num_rollouts=4,
+        )
+
+    first = render(9)
+    assert render(9)["agent"] == first["agent"]
+    assert first["metadata"]["harness"] == first["agent"]["harness"]
+    assert {
+        render(group_index)["agent"]["harness"]
+        for group_index in range(8)
+    } == {"pi", "codex", "claude_code", "qwen_code"}
+
+
+def test_render_task_payload_without_pool_preserves_agent_and_metadata() -> None:
+    args = _args()
+    config = resolve_polar_slime_config(args)
+    payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=SimpleNamespace(
+            prompt="prompt",
+            metadata={"image": "runtime:latest", "instance_id": "abc123"},
+            group_index=9,
+        ),
+        instruction="Fix the bug",
+        rollout_id=2,
+        task_position=0,
+        num_rollouts=4,
+    )
+
+    assert payload["agent"] == {
+        "harness": "codex",
+        "model_name": "openai/gpt-test",
+    }
+    assert payload["metadata"] == {"instance": "abc123"}
 
 
 def test_render_task_payload_sets_early_stop_threshold_with_grace() -> None:

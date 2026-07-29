@@ -123,6 +123,8 @@ smoke_rows="${smoke_rows:-0}"
 
 model_name="${model_name:-Qwen/Qwen3.5-4B}"
 agent_harness="${agent_harness:-pi}"
+harness_pool="${harness_pool:-}"
+harness_seed="${harness_seed:-0}"
 agent_label="${agent_label:-${agent_harness}}"
 pi_model_name="${pi_model_name:-openai/${model_name}}"
 codex_model_name="${codex_model_name:-${model_name}}"
@@ -130,11 +132,15 @@ codex_version="${codex_version:-}"
 codex_reasoning_effort="${codex_reasoning_effort:-}"
 codex_reasoning_summary="${codex_reasoning_summary:-}"
 claude_model_name="${claude_model_name:-${model_name}}"
+qwen_code_model_name="${qwen_code_model_name:-${model_name}}"
+qwen_code_max_output_tokens="${qwen_code_max_output_tokens:-}"
 claude_max_turns="${claude_max_turns:-}"
 claude_max_thinking_tokens="${claude_max_thinking_tokens:-}"
 anthropic_max_tokens="${anthropic_max_tokens:-}"
-if [ "${agent_harness}" = "claude_code" ] && [ -z "${anthropic_max_tokens}" ]; then
-    anthropic_max_tokens=2048
+if [ -z "${anthropic_max_tokens}" ]; then
+    case ",${harness_pool:-${agent_harness}}," in
+        *,claude_code,*) anthropic_max_tokens=2048 ;;
+    esac
 fi
 hf_checkpoint="${hf_checkpoint:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/model/Qwen3.5-4B}"
 model_args_file="$(abs_path "${model_args_file:-${MODEL_ARGS_FILE:-${script_dir}/model_args.sh}}")"
@@ -236,6 +242,7 @@ else
     max_tokens_per_gpu="${max_tokens_per_gpu:-30000}"
 fi
 global_batch_size="${global_batch_size:-$((rollout_batch_size * n_samples_per_prompt))}"
+qwen_code_max_output_tokens="${qwen_code_max_output_tokens:-${rollout_max_response_len}}"
 num_epoch="${num_epoch:-1}"
 start_rollout_id="${start_rollout_id:-}"
 num_steps_per_rollout="${num_steps_per_rollout:-1}"
@@ -477,6 +484,20 @@ for name in ("communicator.py", "common.py"):
     if "import ray.actor\n" not in text and "import ray\n" in text:
         path.write_text(text.replace("import ray\n", "import ray\nimport ray.actor\n", 1), encoding="utf-8")
 PY
+    "${python_bin}" - "${slime_dir}/train_async.py" <<PY
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+legacy = "        if not args.debug_rollout_only:\n"
+compat = "        if not getattr(args, \"debug_rollout_only\", False):\n"
+if legacy in text:
+    text = text.replace(legacy, compat, 1)
+    path.write_text(text, encoding="utf-8")
+elif compat not in text:
+    raise SystemExit(f"unexpected debug rollout metric guard in {path}")
+PY
 }
 
 
@@ -585,7 +606,7 @@ if "SLIME_EXIT_DURATION_MINUTES" not in text:
     if anchor not in text:
         raise SystemExit(f"unexpected async save/update block in {path}")
     text = text.replace(anchor, replacement, 1)
-    path.write_text(text, encoding="utf-8")
+path.write_text(text, encoding="utf-8")
 PY
     # Current Megatron names this setting use_gloo_process_groups, while Slime
     # consumes enable_gloo_process_groups. Mirror the value so DP>1 metrics can
@@ -936,14 +957,18 @@ render_runtime_configs() {
     export ROLLOUT_SAVE_DIR="${rollout_save_dir}"
     export MODEL_NAME="${model_name}"
     export AGENT_HARNESS="${agent_harness}"
+    export HARNESS_POOL="${harness_pool}"
+    export HARNESS_SEED="${harness_seed}"
     export CODEX_MODEL_NAME="${codex_model_name}"
     export CODEX_VERSION="${codex_version}"
     export CODEX_REASONING_EFFORT="${codex_reasoning_effort}"
     export CODEX_REASONING_SUMMARY="${codex_reasoning_summary}"
     export CLAUDE_MODEL_NAME="${claude_model_name}"
+    export QWEN_CODE_MODEL_NAME="${qwen_code_model_name}"
     export CLAUDE_MAX_TURNS="${claude_max_turns}"
     export CLAUDE_MAX_THINKING_TOKENS="${claude_max_thinking_tokens}"
     export POLAR_ANTHROPIC_MAX_TOKENS="${anthropic_max_tokens}"
+    export QWEN_CODE_MAX_OUTPUT_TOKENS="${qwen_code_max_output_tokens}"
     export SGLANG_ROUTER_BASE_URL="${sglang_router_base_url}"
     export AGENT_CLI_DIR="${agent_cli_dir}"
     export APPTAINER_IMAGE_DIR="${apptainer_image_dir}"
@@ -1078,16 +1103,21 @@ else:
 def env_flag(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
+supported_harnesses = {"pi", "codex", "claude_code", "qwen_code"}
 agent_harness = os.environ["AGENT_HARNESS"].strip()
-if agent_harness not in {"pi", "codex", "claude_code"}:
-    raise SystemExit(f"Unsupported agent_harness for this smoke launcher: {agent_harness}")
+pool_names = [
+    name.strip()
+    for name in os.environ.get("HARNESS_POOL", "").split(",")
+    if name.strip()
+]
+enabled_harnesses = pool_names or [agent_harness]
+unknown = sorted(set(enabled_harnesses) - supported_harnesses)
+if unknown:
+    raise SystemExit(f"Unsupported agent harness(es): {unknown}")
+if len(enabled_harnesses) != len(set(enabled_harnesses)):
+    raise SystemExit(f"Harness pool contains duplicates: {enabled_harnesses}")
 
-agent = task.setdefault("agent", {})
-agent["harness"] = agent_harness
-agent["settings"] = {}
-settings = agent["settings"]
-
-if agent_harness == "pi":
+if "pi" in enabled_harnesses:
     pi_settings = {
         "compaction": {"enabled": env_flag("PI_COMPACTION_ENABLED")},
         "retry": {
@@ -1108,28 +1138,51 @@ if agent_harness == "pi":
             f"printf '%s' {shlex.quote(settings_b64)} | base64 -d > \"$HOME/.pi/agent/settings.json\""
         ),
     })
-    agent["model_name"] = os.environ["PI_MODEL_NAME"]
-    settings["api_type"] = os.environ["PI_API_TYPE"]
-    settings["context_window"] = int(os.environ["PI_CONTEXT_WINDOW"])
-    settings["max_tokens"] = int(os.environ["PI_MAX_TOKENS"])
-    settings.setdefault("compat", {})["maxTokensField"] = "max_tokens"
-    if os.environ.get("PI_THINKING"):
-        settings["thinking"] = os.environ["PI_THINKING"]
-elif agent_harness == "codex":
-    agent["model_name"] = os.environ["CODEX_MODEL_NAME"]
-    # The shared CLI is installed from @openai/codex@latest, so do not pin the
-    # code default unless the caller explicitly requests a version check.
-    settings["version"] = os.environ.get("CODEX_VERSION") or None
-    if os.environ.get("CODEX_REASONING_EFFORT"):
-        settings["reasoning_effort"] = os.environ["CODEX_REASONING_EFFORT"]
-    if os.environ.get("CODEX_REASONING_SUMMARY"):
-        settings["reasoning_summary"] = os.environ["CODEX_REASONING_SUMMARY"]
-elif agent_harness == "claude_code":
-    agent["model_name"] = os.environ["CLAUDE_MODEL_NAME"]
-    if os.environ.get("CLAUDE_MAX_TURNS"):
-        settings["max_turns"] = int(os.environ["CLAUDE_MAX_TURNS"])
-    if os.environ.get("CLAUDE_MAX_THINKING_TOKENS"):
-        settings["max_thinking_tokens"] = int(os.environ["CLAUDE_MAX_THINKING_TOKENS"])
+
+def build_agent(harness):
+    agent = {"harness": harness, "settings": {}}
+    settings = agent["settings"]
+    if harness == "pi":
+        agent["model_name"] = os.environ["PI_MODEL_NAME"]
+        settings["api_type"] = os.environ["PI_API_TYPE"]
+        settings["context_window"] = int(os.environ["PI_CONTEXT_WINDOW"])
+        settings["max_tokens"] = int(os.environ["PI_MAX_TOKENS"])
+        settings.setdefault("compat", {})["maxTokensField"] = "max_tokens"
+        if os.environ.get("PI_THINKING"):
+            settings["thinking"] = os.environ["PI_THINKING"]
+    elif harness == "codex":
+        agent["model_name"] = os.environ["CODEX_MODEL_NAME"]
+        # The shared CLI is installed from @openai/codex@latest, so do not pin
+        # the code default unless the caller requests a version check.
+        settings["version"] = os.environ.get("CODEX_VERSION") or None
+        if os.environ.get("CODEX_REASONING_EFFORT"):
+            settings["reasoning_effort"] = os.environ["CODEX_REASONING_EFFORT"]
+        if os.environ.get("CODEX_REASONING_SUMMARY"):
+            settings["reasoning_summary"] = os.environ["CODEX_REASONING_SUMMARY"]
+    elif harness == "claude_code":
+        agent["model_name"] = os.environ["CLAUDE_MODEL_NAME"]
+        if os.environ.get("POLAR_ANTHROPIC_MAX_TOKENS"):
+            agent.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ[
+                "POLAR_ANTHROPIC_MAX_TOKENS"
+            ]
+        if os.environ.get("CLAUDE_MAX_TURNS"):
+            settings["max_turns"] = int(os.environ["CLAUDE_MAX_TURNS"])
+        if os.environ.get("CLAUDE_MAX_THINKING_TOKENS"):
+            settings["max_thinking_tokens"] = int(os.environ["CLAUDE_MAX_THINKING_TOKENS"])
+    elif harness == "qwen_code":
+        agent["model_name"] = os.environ["QWEN_CODE_MODEL_NAME"]
+        agent.setdefault("env", {})["QWEN_CODE_MAX_OUTPUT_TOKENS"] = os.environ[
+            "QWEN_CODE_MAX_OUTPUT_TOKENS"
+        ]
+    return agent
+
+task["agent"] = build_agent(agent_harness)
+if pool_names:
+    config["polar_harness_pool"] = [build_agent(name) for name in pool_names]
+    config["polar_harness_seed"] = int(os.environ["HARNESS_SEED"])
+else:
+    config.pop("polar_harness_pool", None)
+    config.pop("polar_harness_seed", None)
 task.setdefault("builder", {})["strategy"] = os.environ["POLAR_BUILDER_STRATEGY"]
 
 Path(config_out).parent.mkdir(parents=True, exist_ok=True)
@@ -1185,7 +1238,12 @@ preflight() {
     [ -f "${slime_dir}/train_async.py" ] || die "Slime missing: ${slime_dir}"
     [ -d "${megatron_dir}/megatron" ] || die "Megatron missing: ${megatron_dir}"
     [ -x "${agent_cli_dir}/bin/node" ] || die "Node CLI missing: ${agent_cli_dir}/bin/node"
-    case "${agent_harness}" in
+    local configured_harnesses="${harness_pool:-${agent_harness}}"
+    local harness
+    local harnesses=()
+    IFS=, read -r -a harnesses <<<"${configured_harnesses}"
+    for harness in "${harnesses[@]}"; do
+    case "${harness}" in
         pi)
             [ -x "${agent_cli_dir}/bin/pi" ] || die "PI CLI missing: ${agent_cli_dir}/bin/pi"
             PATH="${agent_cli_dir}/bin:${PATH}" "${agent_cli_dir}/bin/pi" --version >/dev/null 2>&1 || \
@@ -1193,8 +1251,10 @@ preflight() {
             ;;
         codex) [ -x "${agent_cli_dir}/bin/codex" ] || die "Codex CLI missing: ${agent_cli_dir}/bin/codex" ;;
         claude_code) [ -x "${agent_cli_dir}/bin/claude" ] || die "Claude Code CLI missing: ${agent_cli_dir}/bin/claude" ;;
-        *) die "Unsupported agent_harness: ${agent_harness}" ;;
+        qwen_code) [ -x "${agent_cli_dir}/bin/qwen" ] || die "Qwen Code CLI missing: ${agent_cli_dir}/bin/qwen" ;;
+        *) die "Unsupported agent harness: ${harness}" ;;
     esac
+    done
     "${python_bin}" - <<'PY'
 import importlib
 mods = ["ray", "torch", "sglang", "polar", "yaml", "httpx", "wandb"]
@@ -1754,9 +1814,13 @@ log "Smoke rows: ${smoke_rows}"
 log "Runtime SIF dir: ${apptainer_image_dir}"
 log "Agent CLI dir: ${agent_cli_dir}"
 log "Agent harness: ${agent_harness}"
+if [ -n "${harness_pool}" ]; then
+    log "Harness pool: ${harness_pool} (seed=${harness_seed})"
+fi
 if [ -n "${anthropic_max_tokens}" ]; then
     log "Anthropic max tokens cap: ${anthropic_max_tokens}"
 fi
+log "Qwen Code max output tokens: ${qwen_code_max_output_tokens}"
 log "GPU split: total=${total_gpus}, train=${train_num_gpus}, rollout=${rollout_num_gpus}, tp=${tensor_model_parallel_size}"
 log "Batch: rollout=${rollout_batch_size}, samples/prompt=${n_samples_per_prompt}, num_rollout=${num_rollout:-epoch}"
 log "Rollout fault tolerance: ${use_fault_tolerance} (interval=${rollout_health_check_interval}s, timeout=${rollout_health_check_timeout}s)"

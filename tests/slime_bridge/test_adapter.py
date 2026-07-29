@@ -113,6 +113,28 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
     assert sample.metadata["polar"]["rollout_step"] == 7
 
 
+def test_session_result_to_samples_exposes_selected_harness(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    result = _session_result(
+        trace=Trace(
+            prompt_ids=[1],
+            response_ids=[2],
+            loss_mask=[1],
+            response_logprobs=[-0.1],
+        )
+    )
+    result.metadata["harness"] = "qwen_code"
+
+    sample = session_result_to_samples(
+        result,
+        group_index=1,
+        trajectory_index=2,
+    )[0]
+
+    assert sample.metadata["polar"]["harness"] == "qwen_code"
+    assert sample.metadata["polar"]["result_metadata"]["harness"] == "qwen_code"
+
+
 def test_session_result_to_samples_shares_group_id_across_trace_siblings(monkeypatch) -> None:
     monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
     traces = [

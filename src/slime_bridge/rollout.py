@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import queue
+import re
 import statistics
 import tempfile
 import threading
@@ -125,7 +126,7 @@ def _build_task_payload(
         task_position=task_position,
         num_rollouts=len(group),
     )
-    return render_task_payload(
+    payload = render_task_payload(
         args=args,
         config=config,
         sample=first_sample,
@@ -134,6 +135,15 @@ def _build_task_payload(
         task_position=task_position,
         num_rollouts=len(group),
     )
+    harness = (payload.get("metadata") or {}).get("harness")
+    if harness:
+        logger.info(
+            "Selected harness=%s for prompt group_index=%s task_id=%s",
+            harness,
+            getattr(first_sample, "group_index", None),
+            payload.get("task_id"),
+        )
+    return payload
 
 
 def _attach_scheduler_metadata(
@@ -1353,6 +1363,7 @@ def _polar_extra_metrics(
     postrun_ms: list[float] = []
     session_is_placeholder: dict[str, bool] = {}
     session_report: dict[str, dict[str, Any]] = {}
+    harness_sessions: dict[str, int] = {}
     completed_session_rewards: list[float] = []
     policy_staleness: list[float] = []
     for sample in flat_samples:
@@ -1365,6 +1376,10 @@ def _polar_extra_metrics(
             continue
         if session_id not in seen:
             seen.add(session_id)
+            harness = polar_meta.get("harness")
+            if harness:
+                name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(harness))
+                harness_sessions[name] = harness_sessions.get(name, 0) + 1
             timing = polar_meta.get("timing") or {}
             if timing:
                 register_to_init_queue_ms.append(
@@ -1411,6 +1426,8 @@ def _polar_extra_metrics(
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
         out["polar/eval/resolved_rate"] = resolved / graded_sessions
+    for harness, count in harness_sessions.items():
+        out[f"polar/harness/{harness}/sessions"] = float(count)
     return out
 
 

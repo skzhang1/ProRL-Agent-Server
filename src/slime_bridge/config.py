@@ -6,10 +6,12 @@ from copy import deepcopy
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import random
 import re
 from types import SimpleNamespace
 from typing import Any
 
+from polar.agent.models import AgentSpec
 from polar.config import TopologyConfig
 
 _PLACEHOLDER_RE = re.compile(r"{([^{}]+)}")
@@ -19,6 +21,8 @@ _PLACEHOLDER_RE = re.compile(r"{([^{}]+)}")
 class PolarSlimeConfig:
     rollout_server_url: str
     task_template: dict[str, Any]
+    harness_pool: tuple[dict[str, Any], ...]
+    harness_seed: int
     task_id_template: str
     instruction_template: str | None
     reward_key: str
@@ -53,6 +57,36 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         raise ValueError("polar_task_template must be a mapping")
     if "agent" not in task_template:
         raise ValueError("polar_task_template must include an agent spec")
+
+    raw_harness_pool = getattr(args, "polar_harness_pool", None)
+    harness_pool: tuple[dict[str, Any], ...] = ()
+    if raw_harness_pool not in (None, []):
+        if not isinstance(raw_harness_pool, list) or not raw_harness_pool:
+            raise ValueError("polar_harness_pool must be a non-empty list")
+        validated_pool: list[dict[str, Any]] = []
+        identities: set[str] = set()
+        for index, raw_spec in enumerate(raw_harness_pool):
+            if not isinstance(raw_spec, dict):
+                raise ValueError(
+                    f"polar_harness_pool[{index}] must be an agent spec mapping"
+                )
+            try:
+                spec = AgentSpec.model_validate(raw_spec)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid agent spec in polar_harness_pool[{index}]: {exc}"
+                ) from exc
+            identity = spec.harness or spec.import_path
+            assert identity is not None
+            if identity in identities:
+                raise ValueError(
+                    f"polar_harness_pool contains duplicate agent source: {identity}"
+                )
+            identities.add(identity)
+            validated_pool.append(
+                spec.model_dump(mode="python", exclude_defaults=True, exclude_none=True)
+            )
+        harness_pool = tuple(validated_pool)
 
     max_async_level = int(getattr(args, "polar_max_async_level", 2))
     if max_async_level <= 0:
@@ -109,6 +143,15 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
         task_template=task_template,
+        harness_pool=harness_pool,
+        harness_seed=int(
+            getattr(
+                args,
+                "polar_harness_seed",
+                getattr(args, "rollout_seed", 0),
+            )
+            or 0
+        ),
         task_id_template=str(
             getattr(args, "polar_task_id_template", "polar-slime-{rollout_id}-{sample.group_index}")
         ),
@@ -163,6 +206,23 @@ def render_task_payload(
     payload = _render_template_value(deepcopy(config.task_template), context)
     if not isinstance(payload, dict):
         raise ValueError("polar_task_template must render to a mapping")
+
+    if config.harness_pool:
+        group_index = getattr(sample, "group_index", None)
+        if group_index is None:
+            raise ValueError(
+                "multi-harness sampling requires sample.group_index"
+            )
+        agent = deepcopy(
+            random.Random(f"{config.harness_seed}:{int(group_index)}").choice(
+                config.harness_pool
+            )
+        )
+        payload["agent"] = agent
+        metadata = payload.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("polar task metadata must render to a mapping")
+        metadata["harness"] = agent.get("harness") or agent.get("import_path")
 
     payload["task_id"] = str(_render_template_value(config.task_id_template, context))
     payload["instruction"] = instruction

@@ -138,9 +138,10 @@ def _build_sample(
 
     prompt_value = prompt_messages if prompt_messages else ""
 
+    result_metadata = deepcopy(getattr(result, "metadata", {}) or {})
     polar_metadata: dict[str, Any] = {
         "node_id": result.node_id,
-        "result_metadata": deepcopy(getattr(result, "metadata", {}) or {}),
+        "result_metadata": result_metadata,
         "result_error": result.error,
         "session_id": result.session_id,
         "session_status": result.status,
@@ -158,6 +159,8 @@ def _build_sample(
             "response_messages": deepcopy(response_messages),
         },
     }
+    if result_metadata.get("harness"):
+        polar_metadata["harness"] = result_metadata["harness"]
     polar_metadata.update(_scheduler_metadata(result, trace))
 
     grouping_kwargs = _sample_grouping_kwargs(Sample, index)
@@ -192,9 +195,10 @@ def _build_dummy_sample(
     accept a partially usable group while still surfacing empty sessions in
     Polar metrics.
     """
+    result_metadata = deepcopy(getattr(result, "metadata", {}) or {})
     polar_metadata: dict[str, Any] = {
         "node_id": result.node_id,
-        "result_metadata": deepcopy(getattr(result, "metadata", {}) or {}),
+        "result_metadata": result_metadata,
         "result_error": result.error,
         "session_id": result.session_id,
         "session_status": result.status,
@@ -206,6 +210,8 @@ def _build_dummy_sample(
         "trajectory_status": result.trajectory.status,
         "placeholder": True,
     }
+    if result_metadata.get("harness"):
+        polar_metadata["harness"] = result_metadata["harness"]
     polar_metadata.update(_scheduler_metadata(result, None))
     grouping_kwargs = _sample_grouping_kwargs(Sample, index)
     return Sample(
