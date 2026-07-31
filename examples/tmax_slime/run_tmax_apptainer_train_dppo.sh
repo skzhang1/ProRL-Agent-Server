@@ -245,6 +245,10 @@ global_batch_size="${global_batch_size:-$((rollout_batch_size * n_samples_per_pr
 qwen_code_max_output_tokens="${qwen_code_max_output_tokens:-${rollout_max_response_len}}"
 num_epoch="${num_epoch:-1}"
 start_rollout_id="${start_rollout_id:-}"
+# Disable the training-side graceful deadline even for Slurm jobs submitted
+# before the outer launcher was updated. Those queued jobs still source this
+# shared launcher at runtime and should run until their 4-hour Slurm walltime.
+exit_duration_minutes=0
 num_steps_per_rollout="${num_steps_per_rollout:-1}"
 distributed_timeout_minutes="${distributed_timeout_minutes:-180}"
 sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.8}"

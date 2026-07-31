@@ -80,11 +80,10 @@ target_num_rollout=500
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
-# Count this from the end of model/Ray initialization. Checking only at a safe
-# rollout boundary and then completing one final prefetched rollout normally
-# leaves roughly 10-20 minutes for a synchronous checkpoint and cleanup inside
-# the four-hour Slurm allocation.
-exit_duration_minutes=160
+# Do not impose a training-side deadline. Each singleton allocation runs until
+# the 4-hour Slurm walltime (or until all 500 rollouts finish), and its successor
+# resumes from the latest fully committed checkpoint.
+exit_duration_minutes=0
 
 ##############################################################################################
 # Model and DPPO Settings
@@ -249,10 +248,10 @@ case "${target_num_rollout}" in
     ''|*[!0-9]*) die "target_num_rollout must be a positive integer" ;;
 esac
 case "${exit_duration_minutes}" in
-    ''|*[!0-9]*) die "exit_duration_minutes must be a positive integer" ;;
+    ''|*[!0-9]*) die "exit_duration_minutes must be a non-negative integer" ;;
 esac
 [ "${target_num_rollout}" -ge 1 ] || die "target_num_rollout must be a positive integer"
-[ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
+[ "${exit_duration_minutes}" -eq 0 ] || die "training-side deadline must remain disabled"
 
 ##############################################################################################
 # Resume Checkpoint
@@ -724,7 +723,7 @@ TMax PI 4B DPPO - fresh 500-step training
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
-  scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}
+  scheduling:${resume_mode}, Slurm walltime=4:00:00, training deadline=off, singleton job name=${SLURM_JOB_NAME}
   boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id:-checkpoint})
   stability: lr=${train_lr}, clip=${clip_grad}, per_token=${calculate_per_token_loss}, logprob_diff=${max_train_rollout_logprob_abs_diff}, rollout_ft=${use_fault_tolerance}
   limits:    async=${polar_max_async_level}, max_steps=${polar_max_steps}, session=${polar_task_timeout_seconds}s, request=${polar_request_timeout}s
