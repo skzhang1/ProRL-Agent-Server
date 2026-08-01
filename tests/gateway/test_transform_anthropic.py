@@ -4,6 +4,14 @@ from polar.gateway.transform.anthropic import AnthropicTransformer
 
 IMAGE_B64 = "abc123"
 IMAGE_URL = f"data:image/png;base64,{IMAGE_B64}"
+TASK_TOOLS_REMINDER = (
+    "\n\nThe task tools haven't been used recently. If you're working on tasks that "
+    "would benefit from tracking progress, consider using TaskCreate to add new "
+    "tasks and TaskUpdate to update task status (set to in_progress when starting, "
+    "completed when done). Also consider cleaning up the task list if it has "
+    "become stale. Only use these if relevant to the current work. This is just a "
+    "gentle reminder - ignore if not applicable.\n"
+)
 
 
 def test_anthropic_request_maps_all_fields_and_image_input_to_chat() -> None:
@@ -127,6 +135,55 @@ def test_anthropic_request_maps_all_fields_and_image_input_to_chat() -> None:
         "function": {"name": "write_answer"},
     }
     assert transformed["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_anthropic_request_collapses_repeated_task_tools_reminders() -> None:
+    transformer = AnthropicTransformer()
+
+    for reminder_count in (0, 1, 3):
+        transformed = transformer.transform_request(
+            {
+                "system": "Stable system prompt." + TASK_TOOLS_REMINDER * reminder_count,
+                "messages": [{"role": "user", "content": "Continue."}],
+            }
+        )
+
+        expected_count = min(reminder_count, 1)
+        assert transformed["messages"][0] == {
+            "role": "system",
+            "content": "Stable system prompt." + TASK_TOOLS_REMINDER * expected_count,
+        }
+        assert (
+            transformed["messages"][0]["content"].count(TASK_TOOLS_REMINDER)
+            == expected_count
+        )
+
+
+def test_anthropic_request_collapses_reminders_from_system_role_messages() -> None:
+    transformer = AnthropicTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "system": "Stable system prompt.",
+            "messages": [
+                {"role": "user", "content": "Continue."},
+                {"role": "system", "content": TASK_TOOLS_REMINDER},
+                {"role": "assistant", "content": "Working."},
+                {"role": "system", "content": "Important runtime note."},
+                {"role": "system", "content": TASK_TOOLS_REMINDER},
+            ],
+        }
+    )
+
+    system_content = transformed["messages"][0]["content"]
+    assert system_content.startswith("Stable system prompt.")
+    assert system_content.count(TASK_TOOLS_REMINDER) == 1
+    assert "Important runtime note." in system_content
+    assert [message["role"] for message in transformed["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+    ]
 
 
 def test_anthropic_request_maps_multi_turn_reasoning_and_parallel_tools() -> None:

@@ -30,6 +30,34 @@ _CLAUDE_CODE_BILLING_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header:[^\n]*\n?", re.IGNORECASE
 )
 
+# Claude Code periodically appends this reminder to its system prompt when the
+# task tools are idle. Some CLI versions retain every previous copy, so the
+# system prompt grows by the same block repeatedly. Because the block is
+# inserted before the system end marker, each extra copy breaks token-prefix
+# continuity and makes prefix_merging start another training trace. Preserve
+# the first reminder while removing later exact copies wherever they occur.
+_CLAUDE_CODE_TASK_TOOLS_REMINDER = (
+    "\n\nThe task tools haven't been used recently. If you're working on tasks that "
+    "would benefit from tracking progress, consider using TaskCreate to add new "
+    "tasks and TaskUpdate to update task status (set to in_progress when starting, "
+    "completed when done). Also consider cleaning up the task list if it has "
+    "become stale. Only use these if relevant to the current work. This is just a "
+    "gentle reminder - ignore if not applicable.\n"
+)
+
+
+def _sanitize_claude_code_system_content(content: str) -> str:
+    """Remove request-variant metadata and collapse retained reminders."""
+    content = _CLAUDE_CODE_BILLING_HEADER_RE.sub("", content)
+    first_reminder = content.find(_CLAUDE_CODE_TASK_TOOLS_REMINDER)
+    if first_reminder < 0:
+        return content
+    first_reminder_end = first_reminder + len(_CLAUDE_CODE_TASK_TOOLS_REMINDER)
+    return (
+        content[:first_reminder_end]
+        + content[first_reminder_end:].replace(_CLAUDE_CODE_TASK_TOOLS_REMINDER, "")
+    )
+
 
 @dataclass
 class _AnthropicToolCallState:
@@ -337,9 +365,7 @@ class AnthropicTransformer(BaseTransformer):
         system = body.get("system")
         if system:
             system_content = self._flatten_content(system)
-            # Drop Claude Code's per-request billing header line (breaks
-            # prefix_merging because cch= changes every turn).
-            system_content = _CLAUDE_CODE_BILLING_HEADER_RE.sub("", system_content)
+            system_content = _sanitize_claude_code_system_content(system_content)
             if system_content:
                 messages.append({"role": "system", "content": system_content})
 
@@ -391,10 +417,22 @@ class AnthropicTransformer(BaseTransformer):
                     body.get("tool_choice", {"type": "auto"})
                 )
 
-        return self._normalize_request(
+        result = self._normalize_request(
             result,
             body.get("_polar_model_served"),
         )
+        # Claude Code may inject additional role=system messages during a
+        # session. Normalize first so all system fragments are merged, then
+        # sanitize the complete prompt rather than only the top-level field.
+        for message in result.get("messages", []):
+            if message.get("role") == "system" and isinstance(
+                message.get("content"),
+                str,
+            ):
+                message["content"] = _sanitize_claude_code_system_content(
+                    message["content"]
+                )
+        return result
 
     def transform_response(
         self,
