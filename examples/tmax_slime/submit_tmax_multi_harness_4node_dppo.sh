@@ -177,13 +177,13 @@ rollout_health_check_first_wait=0
 ##############################################################################################
 
 # Fixed identity: this task cannot inherit an older experiment name or save path.
-run_label="dppo-4n-multiharness-rb8-s16-500step-v1"
-experiment_name="tmax_multiharness_4b_dppo_4n_rb8_s16_500step_v1"
+run_label="dppo-4n-multiharness-rb8-s16-500step-v2"
+experiment_name="tmax_multiharness_4b_dppo_4n_rb8_s16_500step_v2"
 run_id="${experiment_name}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
-run_generation="20260731-dppo-4n-multiharness-rb8-s16-500step-v1"
+run_generation="20260731-dppo-4n-multiharness-rb8-s16-500step-v2"
 rollout_save_dir="${run_dir}/rollout_results"
 full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_ready_prefix256.jsonl"
 prompt_data="${run_dir}/tmax_train.jsonl"
