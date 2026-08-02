@@ -249,6 +249,9 @@ start_rollout_id="${start_rollout_id:-}"
 # before the outer launcher was updated. Those queued jobs still source this
 # shared launcher at runtime and should run until their 4-hour Slurm walltime.
 exit_duration_minutes=0
+train_idle_pulse_after_seconds="${train_idle_pulse_after_seconds:-1680}"
+train_idle_pulse_duration_seconds="${train_idle_pulse_duration_seconds:-120}"
+train_idle_pulse_matrix_size="${train_idle_pulse_matrix_size:-2048}"
 num_steps_per_rollout="${num_steps_per_rollout:-1}"
 distributed_timeout_minutes="${distributed_timeout_minutes:-180}"
 sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.8}"
@@ -393,6 +396,9 @@ export SLIME_DEBUG_ONE_PER_GROUP="${SLIME_DEBUG_ONE_PER_GROUP:-0}"
 export SLIME_DEBUG_GRAD_HOOKS="${SLIME_DEBUG_GRAD_HOOKS:-0}"
 export SLIME_DEBUG_PARAM_GRADS="${SLIME_DEBUG_PARAM_GRADS:-0}"
 export SLIME_EXIT_DURATION_MINUTES="${exit_duration_minutes:-0}"
+export SLIME_TRAIN_IDLE_PULSE_AFTER_SECONDS="${train_idle_pulse_after_seconds}"
+export SLIME_TRAIN_IDLE_PULSE_DURATION_SECONDS="${train_idle_pulse_duration_seconds}"
+export SLIME_TRAIN_IDLE_PULSE_MATRIX_SIZE="${train_idle_pulse_matrix_size}"
 export RAY_MEMORY_USAGE_THRESHOLD="${RAY_MEMORY_USAGE_THRESHOLD:-0.99}"
 export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-${RAY_MEMORY_USAGE_THRESHOLD}}"
 export WANDB_API_KEY="${wandb_api_key}"
@@ -1527,6 +1533,8 @@ keys = [
     "NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_DEBUG", "NVTE_DEBUG_LEVEL",
     "SLIME_SGLANG_BASE_PORT", "SLIME_RESPONSE_ONLY_LOGPROBS", "SLIME_DEBUG_ONE_PER_GROUP",
     "SLIME_DEBUG_GRAD_HOOKS", "SLIME_DEBUG_PARAM_GRADS", "SLIME_EXIT_DURATION_MINUTES",
+    "SLIME_TRAIN_IDLE_PULSE_AFTER_SECONDS", "SLIME_TRAIN_IDLE_PULSE_DURATION_SECONDS",
+    "SLIME_TRAIN_IDLE_PULSE_MATRIX_SIZE",
     "WANDB_API_KEY", "WANDB_MODE", "WANDB_PROJECT", "WANDB_ENTITY", "WANDB_DIR",
     "HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE", "TRANSFORMERS_CACHE",
     "HF_DATASETS_CACHE", "HF_MODULES_CACHE", "SENTENCE_TRANSFORMERS_HOME",

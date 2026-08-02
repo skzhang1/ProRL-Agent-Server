@@ -85,6 +85,12 @@ smoke_rows="${smoke_rows:-0}"
 # resumes from the latest fully committed checkpoint.
 exit_duration_minutes=0
 
+# Keep only the eight train-side GPUs active during exceptionally long rollout
+# waits. The pulse stops and drains before any train/save/weight-sync operation.
+train_idle_pulse_after_seconds=1680
+train_idle_pulse_duration_seconds=120
+train_idle_pulse_matrix_size=2048
+
 ##############################################################################################
 # Model and DPPO Settings
 ##############################################################################################
@@ -447,6 +453,7 @@ export attention_backend qkv_format use_dynamic_batch_size use_sequence_parallel
 export load_debug_rollout_data load_debug_rollout_data_subsample
 export rollout_batch_size n_samples_per_prompt num_epoch target_num_rollout num_rollout start_rollout_id smoke_rows
 export exit_duration_minutes
+export train_idle_pulse_after_seconds train_idle_pulse_duration_seconds train_idle_pulse_matrix_size
 export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
