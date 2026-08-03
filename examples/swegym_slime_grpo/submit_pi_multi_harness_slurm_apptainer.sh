@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tmax-mh-4b-dppo-s16-500
+#SBATCH --job-name=webarea-mh-q35-4n
 #SBATCH --account=nvr_lpr_agentic
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
@@ -12,49 +12,34 @@
 #SBATCH --dependency=singleton
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --exclude=pool1-[00001-00224,00230,00236,00254],pool0-[00126,04476,04843,04892,04982,05158,05432],pool0-[05800-05984]
-#SBATCH --output=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/examples/tmax_slime/logs/slurm/%x-%j.out
-#SBATCH --error=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/examples/tmax_slime/logs/slurm/%x-%j.err
+#SBATCH --exclude=pool1-[00001-00224],pool0-[00126,04476,04843,04892,04982,05158,05432],pool0-[05800-05984]
+#SBATCH --output=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/logs/slurm/%x-%j.out
+#SBATCH --error=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server/logs/slurm/%x-%j.err
 #SBATCH --export=ALL
 
-# Four-node multi-harness + Qwen3.5-4B TMax DPPO training.
-#
-# Rollout settings come from the independently validated two-node 8-step test.
-# Slime places the actor on the eight GPUs of the lowest-IP node and the 24
-# rollout engines on the other three nodes, with one gateway per rollout node.
+# Repeatable four-node multi-harness + Qwen3.5-4B SWE-Gym GRPO training.
+# Node 0 hosts 8 Megatron training GPUs; nodes 1-3 host 24 SGLang rollout GPUs.
+# Submit this same file multiple times; each allocation discovers the newest
+# checkpoint and runs toward the global target until the inner trainer reaches
+# its graceful wall-clock budget.  No per-job rollout boundary is required.
 set -euo pipefail
 
-##############################################################################################
-# Configuration
-##############################################################################################
-
-# Project paths and container runtime.
 project_root="${project_root:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/ProRL-Agent-Server}"
-script_dir="${project_root}/examples/tmax_slime"
-inner_launcher="${script_dir}/run_tmax_apptainer_train_dppo.sh"
-train_sqsh="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/docker/polr_swegym_qwen35_torch211_te2161_fa4b19_numpy126_scipy117_tebindcu130_20260707.sqsh"
+script_dir="${project_root}/examples/swegym_slime_grpo"
+inner_launcher="${script_dir}/run_pi_multi_harness_apptainer_train.sh"
+train_sqsh="${train_sqsh:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/docker/polr_swegym_qwen35_torch211_te2161_fa4b19_numpy126_scipy117_tebindcu130_20260707.sqsh}"
 container_mounts="${container_mounts:-/lustre/fs1:/lustre/fs1,/lustre/fsw:/lustre/fsw}"
-# Stock Apptainer 1.5.2 unconditionally setns()es into the instance user
-# namespace. Pyxis already placed us in that same namespace, so Linux returns
-# EINVAL. Use the locally built binary that skips only this redundant setns;
-# mount and PID namespaces are still entered normally.
-POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-${project_root}/tmp/apptainer-v1.5.2-pyxis-fix/bin/apptainer}"
-POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-0}"
-POLAR_APPTAINER_EXEC_MODE="${POLAR_APPTAINER_EXEC_MODE:-instance}"
-POLAR_APPTAINER_ISOLATE_PID="${POLAR_APPTAINER_ISOLATE_PID:-1}"
-# Friend Slime is allowed; Polar must stay in the current project.
-slime_dir="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/example/slime"
-megatron_dir="${project_root}/tmp/swegym_deps/Megatron-LM"
-reference_recipe=1
-polar_project_root="${polar_project_root:-${project_root}}"
-hf_checkpoint="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/model/Qwen3.5-4B"
-ref_load="${project_root}/tmp/checkpoints/Qwen3.5-4B_torch_dist"
+# Apptainer 1.5.2 cannot re-enter an instance namespace from this Pyxis image.
+# Direct exec reuses the same host overlay and session bind across rollout stages.
+POLAR_APPTAINER_DIRECT_EXEC="${POLAR_APPTAINER_DIRECT_EXEC:-1}"
+# Use the friend Slime checkout validated by Tmax for native train-side idle pulse, and the Megatron checkout validated by the SWE runs.
+slime_source_dir="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/example/slime"
+slime_ref="db7ac8bdbcf1a10b3147e862779d03dc2df31802"
+slime_repo="${slime_source_dir}"
+slime_dir="${script_dir}/tmp/slime-${slime_ref:0:8}"
+megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM}"
 
-##############################################################################################
-# GPU Topology and Training Batch
-##############################################################################################
-
-# One training node and three rollout nodes. The actor uses TP=4/DP=2.
+# Experiment shape. The validated full-run default uses 8 prompt groups x 8 samples = 64 samples/step.
 gpus_per_node=8
 num_nodes=4
 total_gpus=32
@@ -63,139 +48,105 @@ actor_num_nodes=1
 actor_num_gpus_per_node=8
 rollout_num_gpus=24
 rollout_num_gpus_per_engine=1
-tensor_model_parallel_size=4
+tensor_model_parallel_size="${tensor_model_parallel_size:-4}"
 qwen_gdn_backend=fla
 attention_backend=flash
-qkv_format="${qkv_format:-thd}"
+qkv_format=thd
 use_dynamic_batch_size=1
 use_sequence_parallel=1
 micro_batch_size=1
-global_batch_size=128
+global_batch_size="${global_batch_size:-64}"
 load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
-rollout_batch_size=8
-n_samples_per_prompt=16
-num_epoch=1
-# Slime uses an exclusive boundary: rollout IDs 0..499 are 500 training steps.
-target_num_rollout=500
+rollout_batch_size="${rollout_batch_size:-8}"
+n_samples_per_prompt="${n_samples_per_prompt:-8}"
+num_epoch=2
+# Two ceil epochs are 74 optimizer updates with 293 prompts and 8 prompts/step.
+# Slime saves checkpoint iteration 0 after rollout 0, so the exclusive rollout
+# boundary must be 74 to produce iter_0000073. Singleton allocations discover
+# the latest checkpoint and keep that global boundary. An explicit num_rollout keeps manual mode.
+target_num_rollout="${target_num_rollout:-74}"
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
-# Do not impose a training-side deadline. Each singleton allocation runs until
-# the 4-hour Slurm walltime (or until all 500 rollouts finish), and its successor
-# resumes from the latest fully committed checkpoint.
-exit_duration_minutes=0
-
-# Keep only the eight train-side GPUs active during exceptionally long rollout
-# waits. The pulse stops and drains before any train/save/weight-sync operation.
+# Count this from the end of model/Ray initialization. Checking only at a safe
+# rollout boundary and then completing one final prefetched rollout normally
+# leaves roughly 10-20 minutes for a synchronous checkpoint and cleanup inside
+# the four-hour Slurm allocation.
+exit_duration_minutes="${exit_duration_minutes:-190}"
 train_idle_pulse_after_seconds=1680
 train_idle_pulse_duration_seconds=120
 train_idle_pulse_matrix_size=2048
 
-##############################################################################################
-# Model and DPPO Settings
-##############################################################################################
-
 # Compact PI history before the 60k inference limit, then prefix-merge within
 # each segment. TP=4/DP=2 is the four-node smoke-test validated topology.
-max_tokens_per_gpu=67584
-log_probs_chunk_size=256
-rollout_max_response_len=16384
-rollout_max_prompt_len=32000
-sglang_context_length=262144
-sglang_mem_fraction_static=0.7
+max_tokens_per_gpu="${max_tokens_per_gpu:-60000}"
+log_probs_chunk_size="${log_probs_chunk_size:-64}"
+rollout_max_response_len="${rollout_max_response_len:-16000}"
+rollout_max_prompt_len="${rollout_max_prompt_len:-32000}"
+sglang_context_length="${sglang_context_length:-60000}"
+sglang_mem_fraction_static="${sglang_mem_fraction_static:-0.7}"
 distributed_timeout_minutes=180
 save_interval=1
 
-# DPPO uses rollout logprobs without KL loss or TIS.
+# Long tool trajectories can overflow the exponential ratios in low_var_kl and
+# built-in TIS even with a long token cap. Use the bounded k2 form and a lower LR.
 train_lr=5e-7
 clip_grad=0.5
-kl_loss_coef=0
-kl_loss_type="${kl_loss_type:-k2}"
+kl_loss_coef=0.001
+kl_loss_type=k2
 use_tis=0
 eps_clip=0.2
 eps_clip_high=0.28
 eps_clip_c=10.0
-calculate_per_token_loss=1
-max_train_rollout_logprob_abs_diff=0.5
-# The initial 4B PI policy often yields all-zero/all-one groups. Slime's
-# nonzero-std filter retries without a bound, which can leave the actor idle
-# long enough for the cluster reaper to cancel the allocation. Keep all eight
-# 16-sample groups instead: reward centering gives constant-reward groups zero
-# advantage, while mixed-reward groups retain their training signal.
-dynamic_sampling_filter_path=""
-polar_fully_async=1
-polar_early_stop_grace_sessions=4
-polar_max_trajectory_tokens=67584
 
-##############################################################################################
-# Multi-Harness and Polar Settings
-##############################################################################################
-
-# agent_harness remains the backward-compatible single-harness template;
-# harness_pool enables deterministic per-prompt harness sampling.
+# PI/Polar settings.
 agent_harness=pi
 agent_label=multi_harness
 harness_pool=pi,codex,claude_code,qwen_code
 harness_seed=87
+anthropic_max_tokens=2048
+qwen_code_max_output_tokens=4096
 pi_api_type=openai-completions
 # Trigger PI compaction early enough to absorb a large tool result without
 # overshooting SGLang's hard 60k request limit.
 pi_context_window=24000
 pi_max_tokens=512
-# Keep the longer-output harnesses bounded without changing their shared
-# max-step/session limits. Codex intentionally retains its CLI default.
-anthropic_max_tokens=2048
-qwen_code_max_output_tokens=4096
 # Compaction creates a clean prefix break; prefix_merging starts a new trace at
 # that boundary instead of turning the session into a context-limit failure.
 pi_fail_on_context_limit=0
 polar_builder_strategy=prefix_merging
-polar_max_async_level=2
-polar_max_replacement_groups=32
-polar_min_complete_accept_fraction=0.5
-polar_multi_gateway=1
-polar_gateway_count=3
-polar_gateway_ranks=""
-polar_gateway_hosts=""
-polar_gateway_max_init_workers=8
-polar_gateway_max_run_workers=64
-polar_gateway_max_postrun_workers=16
-polar_gateway_max_restarts=0
-# Enforce a hard address-space ceiling inherited by forked/exec'd/daemonized
-# agent processes. PI's Undici/OpenAI request path needs much more virtual
-# address space than its RSS: 2/4/8 GiB fail in WebAssembly initialization,
-# and a semantic streaming-completions probe at 16 GiB never reaches the
-# gateway. Both 32 and 64 GiB complete the request. Keep 64 GiB as headroom
-# for long tool trajectories while stopping the observed ~1.4 TiB runaway.
-polar_runtime_memory_mb=65536
+polar_max_async_level="${polar_max_async_level:-4}"
+polar_min_complete_accept_fraction=0.6
+polar_multi_gateway="${polar_multi_gateway:-1}"
+polar_gateway_count="${polar_gateway_count:-3}"
+polar_gateway_ranks="${polar_gateway_ranks:-}"
+polar_gateway_max_init_workers="${polar_gateway_max_init_workers:-24}"
+polar_gateway_max_run_workers="${polar_gateway_max_run_workers:-96}"
+polar_gateway_max_postrun_workers="${polar_gateway_max_postrun_workers:-64}"
+polar_gateway_max_restarts="${polar_gateway_max_restarts:-20}"
+# Current Polar correctly rejects memory limits for the Apptainer backend.
+polar_runtime_memory_mb=""
 polar_task_timeout_seconds=900
-polar_max_steps=160
-polar_request_timeout=3600
-polar_task_timeout_from_metadata=0
-# Do not mask rollout infrastructure failures during qualification.
-use_fault_tolerance=0
-rollout_health_check_interval=30
-rollout_health_check_timeout=30
-rollout_health_check_first_wait=0
+polar_request_timeout=900
+# Let Slime detect and recreate a rollout SGLang server whose HTTP process dies
+# while the Ray actor remains alive. This avoids failing later in update_weights.
+use_fault_tolerance="${use_fault_tolerance:-1}"
+rollout_health_check_interval="${rollout_health_check_interval:-30}"
+rollout_health_check_timeout="${rollout_health_check_timeout:-30}"
+rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 
-##############################################################################################
-# Experiment and Logging
-##############################################################################################
-
-# Fixed identity: this task cannot inherit an older experiment name or save path.
-run_label="dppo-4n-multiharness-rb8-s16-500step-v2"
-experiment_name="tmax_multiharness_4b_dppo_4n_rb8_s16_500step_v2"
+# Fixed identity shared by checkpoints and W&B. Inherited submit-shell
+# variables cannot redirect this task into another run or checkpoint tree.
+# Use a new script identity when intentionally starting a different experiment.
+run_label="4n32g-train8-rollout24-tp4dp2-8x8-60k-3gw-2ep-fa4b19-pmerge-k2-multiharness"
+experiment_name="webarea-distill_mh_q35_4n_full293_2ep_tp4dp2_8x8_60k_3gw"
 run_id="${experiment_name}"
+run_generation="20260803-swegym-grpo-4n-multiharness-v1"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
-run_generation="20260731-dppo-4n-multiharness-rb8-s16-500step-v2"
 rollout_save_dir="${run_dir}/rollout_results"
-full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_ready_prefix256.jsonl"
-prompt_data="${run_dir}/tmax_train.jsonl"
-tmax_dataset_dir="${tmax_dataset_dir:-/lustre/fsw/portfolios/nvr/users/songyangh/bjin_works/agent_world_model/tmax15k/dataset}"
-tmax_image_dir="${tmax_image_dir:-/lustre/fsw/portfolios/nvr/users/songyangh/bjin_works/agent_world_model/tmax15k/sif}"
 
 # Production invariant: every training allocation must report to the user's
 # approved W&B destination.  Keep these fixed instead of allowing inherited
@@ -209,12 +160,7 @@ wandb_run_id="${run_id}"
 wandb_random_suffix=0
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 
-dry_run=0
-
-##############################################################################################
-# Network and Ray Settings
-##############################################################################################
-
+dry_run="${dry_run:-0}"
 # Host networking can expose stale Polar listeners from an earlier allocation.
 # Give each Slurm job its own control-plane ports instead of fixed 18080/18100.
 port_slot=$((SLURM_JOB_ID % 1000))
@@ -231,30 +177,26 @@ ray_cluster_timeout_seconds=600
 ray_memory_usage_threshold="${ray_memory_usage_threshold:-0.99}"
 ray_memory_monitor_refresh_ms="${ray_memory_monitor_refresh_ms:-}"
 
-##############################################################################################
-# Validation
-##############################################################################################
-
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
 [ "${SLURM_JOB_NUM_NODES:-0}" = "4" ] || die "this script requires exactly four allocated nodes"
-job_account="${SLURM_JOB_ACCOUNT:-default}"
-[ -x "${inner_launcher}" ] || die "missing inner launcher: ${inner_launcher}"
+job_account="${SLURM_JOB_ACCOUNT:-}"
+if [ -z "${job_account}" ]; then
+    job_account="$(scontrol show job -o "${SLURM_JOB_ID}" | sed -n 's/.* Account=\([^ ]*\).*/\1/p')"
+fi
+case "${job_account}" in
+    nvr_lpr_agentic) ;;
+    *) die "account ${job_account:-unknown} is not allowed; use nvr_lpr_agentic" ;;
+esac
+[ -x "${inner_launcher}" ] || die "missing inner launcher"
 [ -f "${train_sqsh}" ] || die "missing training image: ${train_sqsh}"
-[ -s "${full_prompt_data}" ] || die "missing pre-generated TMax prompt pool: ${full_prompt_data}"
-[ -f "${slime_dir}/train_async.py" ] || die "missing friend Slime: ${slime_dir}"
-[ -f "${polar_project_root}/src/polar/__init__.py" ] || die "missing current-project Polar: ${polar_project_root}/src/polar"
-project_root_real="$(readlink -f "${project_root}")"
-polar_project_root_real="$(readlink -f "${polar_project_root}")"
-friend_slime_real="$(readlink -f "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/example/slime")"
-[ "${polar_project_root_real}" = "${project_root_real}" ] || die "Polar must be the current project: ${project_root_real}; got ${polar_project_root_real}"
-[ "$(readlink -f "${slime_dir}")" = "${friend_slime_real}" ] || die "Slime must be ${friend_slime_real}"
-[ "${POLAR_APPTAINER_EXEC_MODE}" = "instance" ] || die "POLAR_APPTAINER_EXEC_MODE must be instance"
-[ "${POLAR_APPTAINER_DIRECT_EXEC}" = "0" ] || die "POLAR_APPTAINER_DIRECT_EXEC must be 0"
-[ "${POLAR_APPTAINER_ISOLATE_PID}" = "1" ] || die "POLAR_APPTAINER_ISOLATE_PID must be 1"
+[ -f "${script_dir}/swegym_train_293.jsonl" ] || die "missing SWE-Gym training data"
+[ -f "${slime_source_dir}/train_async.py" ] || die "missing friend Slime: ${slime_source_dir}"
+[ "$(git -C "${slime_source_dir}" rev-parse HEAD)" = "${slime_ref}" ] || die "friend Slime HEAD does not match pinned ref ${slime_ref}"
+[ -f "${slime_source_dir}/slime/backends/megatron_utils/train_idle_pulse.py" ] || die "friend Slime lacks train idle pulse support"
 [ "$((rollout_batch_size * n_samples_per_prompt))" = "${global_batch_size}" ] || die "global batch must equal rollout_batch_size * n_samples_per_prompt"
 # The inner launcher creates the converted checkpoint and PI CLI when they are
 # absent. This keeps a fresh durable worktree self-contained after cleanup.
@@ -262,35 +204,43 @@ case "${target_num_rollout}" in
     ''|*[!0-9]*) die "target_num_rollout must be a positive integer" ;;
 esac
 case "${exit_duration_minutes}" in
-    ''|*[!0-9]*) die "exit_duration_minutes must be a non-negative integer" ;;
+    ''|*[!0-9]*) die "exit_duration_minutes must be a positive integer" ;;
 esac
-[ "${target_num_rollout}" -ge 1 ] || die "target_num_rollout must be a positive integer"
-[ "${exit_duration_minutes}" -eq 0 ] || die "training-side deadline must remain disabled"
+[ "${target_num_rollout}" -eq 74 ] || \
+    die "target_num_rollout must remain 74 to produce checkpoint iteration 73 for two 293-row epochs at 8 prompts/step"
+[ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
 
-##############################################################################################
-# Resume Checkpoint
-##############################################################################################
-# This run may resume only checkpoints created by this exact training task.
-# A directory from any older experiment is rejected before Ray starts.
+# Strict singleton resume. This run may resume only checkpoints produced by
+# this exact multi-harness task, and a checkpoint is accepted only when all
+# eight model shards and the matching rollout cursor are present.
 run_manifest="${save_dir}/run_generation.txt"
 expected_manifest="run_generation=${run_generation}
 project_root=${project_root}
+slime_source_dir=${slime_source_dir}
+slime_ref=${slime_ref}
 slime_dir=${slime_dir}
-rollout_batch_size=8
-n_samples_per_prompt=16
-global_batch_size=128
-target_num_rollout=500
-dynamic_sampling_filter=off
-session_timeout_seconds=900
-max_steps=160
-harness_pool=pi,codex,claude_code,qwen_code
-harness_seed=87
-pi_max_output_tokens=512
+rollout_batch_size=${rollout_batch_size}
+n_samples_per_prompt=${n_samples_per_prompt}
+global_batch_size=${global_batch_size}
+target_num_rollout=${target_num_rollout}
+num_epoch=${num_epoch}
+algorithm=grpo
+train_lr=${train_lr}
+clip_grad=${clip_grad}
+kl_loss_coef=${kl_loss_coef}
+kl_loss_type=${kl_loss_type}
+use_tis=${use_tis}
+harness_pool=${harness_pool}
+harness_seed=${harness_seed}
+pi_max_output_tokens=${pi_max_tokens}
 codex_max_output_tokens=cli-default
-claude_code_max_output_tokens=2048
-qwen_code_max_output_tokens=4096
+claude_code_max_output_tokens=${anthropic_max_tokens}
+qwen_code_max_output_tokens=${qwen_code_max_output_tokens}
+train_idle_pulse_after_seconds=${train_idle_pulse_after_seconds}
+train_idle_pulse_duration_seconds=${train_idle_pulse_duration_seconds}
+train_idle_pulse_matrix_size=${train_idle_pulse_matrix_size}
 "
-mkdir -p "${script_dir}/logs/slurm" "${run_log_dir}" "${save_dir}" "${rollout_save_dir}"
+mkdir -p "${project_root}/logs/slurm" "${run_log_dir}" "${save_dir}" "${rollout_save_dir}"
 if [ -s "${run_manifest}" ]; then
     [ "$(<"${run_manifest}")" = "${expected_manifest%?}" ] || \
         die "run manifest mismatch; refusing checkpoint directory ${save_dir}"
@@ -343,10 +293,6 @@ fi
 start_rollout_id="${completed_rollouts}"
 num_rollout="${target_num_rollout}"
 
-##############################################################################################
-# W&B Authentication
-##############################################################################################
-
 # Keep credentials out of source and process command lines. Before Pyxis
 # starts, read the submit host's private netrc and forward only the environment
 # value into the container.
@@ -363,16 +309,10 @@ if [ "${use_wandb}" = "1" ] && [ "${wandb_mode}" = "online" ] && [ -z "${wandb_a
     die "online W&B requires WANDB_API_KEY or an api.wandb.ai entry in ~/.netrc"
 fi
 
-printf 'Polar per-session timeout: %ss; max steps: %s\n' \
-    "${polar_task_timeout_seconds}" "${polar_max_steps}"
-
+mkdir -p "${project_root}/logs/slurm" "${run_log_dir}" "${save_dir}" "${rollout_save_dir}"
 stop_file="${run_dir}/ray_workers.stop"
 worker_script="${run_dir}/ray_cluster_rank.sh"
 rm -f "${stop_file}"
-
-##############################################################################################
-# Cluster Topology
-##############################################################################################
 
 mapfile -t slurm_nodes < <(scontrol show hostnames "${SLURM_NODELIST}")
 [ "${#slurm_nodes[@]}" -eq 4 ] || die "expected four Slurm hosts"
@@ -383,10 +323,6 @@ slime_train_ip=""
 slurm_node_records=()
 for idx in "${!slurm_nodes[@]}"; do
     node="${slurm_nodes[$idx]}"
-    # This metadata-only step must not inherit the batch allocation's
-    # 128 CPUs, 8 GPUs, and mem=0/full-node request.  On a valid four-node
-    # allocation that inheritance can make step creation fail with
-    # "Memory required by task is not available" before training starts.
     node_ip="$(srun --mpi=none --overlap --exact -N1 -n1 -w "${node}" \
         --cpus-per-task=1 --mem=64M --gres=none hostname -I | awk '{print $1}')"
     [ -n "${node_ip}" ] || die "failed to resolve node IP for ${node}"
@@ -440,55 +376,35 @@ elif [ -z "${polar_gateway_ranks}" ]; then
     polar_gateway_ranks="$(seq -s, 0 $((polar_gateway_count - 1)))"
 fi
 
-##############################################################################################
-# Runtime Environment
-##############################################################################################
-
 # Lower-case variables are the inner launcher's public settings.
-export project_root script_dir inner_launcher train_sqsh container_mounts slime_dir megatron_dir hf_checkpoint ref_load
-export reference_recipe polar_project_root
-export POLAR_APPTAINER_BIN POLAR_APPTAINER_DIRECT_EXEC POLAR_APPTAINER_EXEC_MODE POLAR_APPTAINER_ISOLATE_PID
+export project_root script_dir inner_launcher train_sqsh container_mounts slime_source_dir slime_repo slime_ref slime_dir megatron_dir
+export POLAR_APPTAINER_DIRECT_EXEC
 export gpus_per_node num_nodes total_gpus train_num_gpus actor_num_nodes actor_num_gpus_per_node
 export rollout_num_gpus rollout_num_gpus_per_engine tensor_model_parallel_size qwen_gdn_backend
 export attention_backend qkv_format use_dynamic_batch_size use_sequence_parallel micro_batch_size global_batch_size
 export load_debug_rollout_data load_debug_rollout_data_subsample
 export rollout_batch_size n_samples_per_prompt num_epoch target_num_rollout num_rollout start_rollout_id smoke_rows
-export exit_duration_minutes
-export train_idle_pulse_after_seconds train_idle_pulse_duration_seconds train_idle_pulse_matrix_size
+export exit_duration_minutes train_idle_pulse_after_seconds train_idle_pulse_duration_seconds train_idle_pulse_matrix_size
 export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
-export calculate_per_token_loss max_train_rollout_logprob_abs_diff dynamic_sampling_filter_path
-export agent_harness agent_label harness_pool harness_seed
-export pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
-export anthropic_max_tokens qwen_code_max_output_tokens
-export polar_builder_strategy polar_max_async_level polar_max_replacement_groups polar_min_complete_accept_fraction
-export polar_fully_async polar_early_stop_grace_sessions polar_max_trajectory_tokens
+export agent_harness agent_label harness_pool harness_seed anthropic_max_tokens qwen_code_max_output_tokens pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
+export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
 export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
 export polar_gateway_max_restarts
-export polar_runtime_memory_mb polar_task_timeout_seconds polar_max_steps polar_request_timeout
-export polar_task_timeout_from_metadata
+export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
 export rollout_port gateway_port
-export run_id run_label run_dir run_log_dir save_dir rollout_save_dir run_generation
-export full_prompt_data prompt_data tmax_dataset_dir tmax_image_dir
+export run_id run_label run_generation run_dir run_log_dir save_dir rollout_save_dir
 export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key
 export dry_run ray_port ray_dashboard_port ray_num_cpus ray_expected_num_gpus ray_cluster_timeout_seconds
 export ray_memory_usage_threshold ray_memory_monitor_refresh_ms
 export ray_head_ip sglang_router_host stop_file
 
-##############################################################################################
-# Worker Script
-##############################################################################################
-
 cat >"${worker_script}" <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
-
-##############################################################################################
-# Worker Identity and Local Runtime
-##############################################################################################
 
 rank="${SLURM_PROCID}"
 node="$(hostname)"
@@ -522,7 +438,7 @@ export XDG_CONFIG_HOME="${cache_root}/xdg-config"
 export XDG_RUNTIME_DIR="${cache_root}/xdg-runtime"
 export CUDA_CACHE_PATH="${cache_root}/cuda-cache"
 export NUMBA_CACHE_DIR="${cache_root}/numba"
-export ray_tmpdir="/dev/shm/webarea-pi-${SLURM_JOB_ID}-${rank}/ray"
+export ray_tmpdir="${cache_root}/ray"
 export RAY_MEMORY_USAGE_THRESHOLD="${ray_memory_usage_threshold:-0.99}"
 export RAY_memory_usage_threshold="${RAY_MEMORY_USAGE_THRESHOLD}"
 if [ -n "${ray_memory_monitor_refresh_ms:-}" ]; then
@@ -552,15 +468,10 @@ PY
 patch_container_runtime_only=1 bash "${inner_launcher}" \
     >"${run_log_dir}/container-patch-rank-${rank}.log" 2>&1
 
-##############################################################################################
-# Worker Cleanup and Diagnostics
-##############################################################################################
-
 ray stop --force >/dev/null 2>&1 || true
 monitor_pid=""
 mem_monitor_pid=""
 gateway_pid=""
-ray_log_stream_pid=""
 preserve_ray_logs() {
     local source_dir="${ray_tmpdir}/session_latest/logs"
     local target_dir="${run_log_dir}/ray-rank-${rank}"
@@ -574,31 +485,15 @@ preserve_ray_logs() {
           -o -name 'log_monitor.*' \) \
         -exec cp -f {} "${target_dir}/" \; 2>/dev/null || true
 }
-stream_ray_control_logs() {
-    local source_dir="${ray_tmpdir}/session_latest/logs"
-    local stream_log="${run_log_dir}/ray-control-rank-${rank}.stream.log"
-    tail -n 0 -F "${source_dir}/raylet.out" "${source_dir}/raylet.err" "${source_dir}/ray_process_exit.log" >>"${stream_log}" 2>&1
-}
-record_signal() {
-    local signal="${1}"
-    printf '[%s] rank=%s node=%s received=%s\n' "$(date -u +%FT%TZ)" "${rank}" "${node}" "${signal}" >>"${run_log_dir}/rank-signals.log"
-}
 cleanup() {
     [ -z "${monitor_pid}" ] || kill "${monitor_pid}" 2>/dev/null || true
     [ -z "${mem_monitor_pid}" ] || kill "${mem_monitor_pid}" 2>/dev/null || true
-    [ -z "${ray_log_stream_pid}" ] || kill "${ray_log_stream_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || kill "${gateway_pid}" 2>/dev/null || true
     [ -z "${gateway_pid}" ] || wait "${gateway_pid}" 2>/dev/null || true
     preserve_ray_logs
     ray stop --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-trap 'record_signal TERM; exit 143' TERM
-trap 'record_signal INT; exit 130' INT
-trap 'record_signal HUP; exit 129' HUP
-trap 'record_signal QUIT; exit 131' QUIT
-stream_ray_control_logs &
-ray_log_stream_pid="$!"
 
 # Lightweight per-node GPU evidence; W&B records the learning curve itself.
 (
@@ -613,37 +508,15 @@ monitor_pid="$!"
 
 (
     while true; do
-        # NRT periodically removes stale top-level /tmp directories even while
-        # the Ray daemons inside them are still alive. Existing workers keep
-        # running, but later SGLang actor recovery then fails because Ray can no
-        # longer bootstrap a worker from its deleted session directory.
-        [ ! -d "${cache_root}" ] || touch "${cache_root}" 2>/dev/null || true
-        [ ! -d "${ray_tmpdir}" ] || touch "${ray_tmpdir}" 2>/dev/null || true
-        [ ! -e "${ray_tmpdir}/session_latest" ] || \
-            touch "${ray_tmpdir}/session_latest" 2>/dev/null || true
         printf 'timestamp=%s node=%s rank=%s\n' "$(date -u +%FT%TZ)" "${node}" "${rank}"
         free -g || true
-        printf '%s\n' 'cgroup memory.events:'
-        cat /sys/fs/cgroup/memory.events 2>/dev/null || true
         ps -eo pid,ppid,rss,vsz,comm,args --sort=-rss | head -16 || true
-        sleep 10
+        sleep 30
     done
 ) >>"${run_log_dir}/mem-rank-${rank}.log" 2>&1 &
 mem_monitor_pid="$!"
 
-##############################################################################################
-# Ray Cluster and Training
-##############################################################################################
-
 if [ "${rank}" = "0" ]; then
-    (
-        cd "${slime_dir}"
-        /opt/polr_venv/bin/python -m pytest -q \
-            tests/test_train_async_checkpoint_order.py \
-            tests/test_train_metric_commit.py \
-            tests/test_update_weight_timing.py
-    ) >"${run_log_dir}/slime-checkpoint-order-tests.log" 2>&1
-
     ray start --head --node-ip-address="${ray_head_ip}" --port="${ray_port}" \
         --dashboard-host=0.0.0.0 --dashboard-port="${ray_dashboard_port}" \
         --num-cpus="${ray_num_cpus}" --num-gpus="${gpus_per_node}" \
@@ -676,19 +549,10 @@ PY
     ray_pid="$!"
     gateway_restarts=0
     start_gateway_sidecar_bg() {
-        local gateway_tmpdir=""
-        if [ "${POLAR_PRESERVE_FAILED_SESSIONS:-0}" = "1" ]; then
-            # tempfile.mkdtemp() in GatewayNodeManager honors TMPDIR. Keep
-            # diagnostic session artifacts on shared Lustre so Slurm's node
-            # epilog cannot erase them before they are inspected.
-            gateway_tmpdir="${run_log_dir}/preserved-sessions-rank-${rank}"
-            mkdir -p "${gateway_tmpdir}"
-        fi
         printf '[%s] starting gateway sidecar rank=%s restart=%s\n' \
             "$(date -u +%FT%TZ)" "${rank}" "${gateway_restarts}" \
             >>"${run_log_dir}/gateway-sidecar-rank-${rank}.supervisor.log"
-        TMPDIR="${gateway_tmpdir:-/tmp}" RAY_NODE_RANK="${rank}" \
-            pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
+        RAY_NODE_RANK="${rank}" pi_multigw_sidecar=1 ray_use_existing_cluster=1 ray_stop_on_exit=0 \
             bash "${inner_launcher}" >>"${run_log_dir}/gateway-sidecar-rank-${rank}.driver.log" 2>&1 &
         gateway_pid="$!"
     }
@@ -696,16 +560,7 @@ PY
         start_gateway_sidecar_bg
     fi
     while [ ! -f "${stop_file}" ]; do
-        if ! kill -0 "${ray_pid}" 2>/dev/null; then
-            set +e
-            wait "${ray_pid}"
-            ray_rc="$?"
-            set -e
-            printf '[%s] ray worker rank=%s node=%s exited rc=%s\n' \
-                "$(date -u +%FT%TZ)" "${rank}" "${node}" "${ray_rc}" \
-                >>"${run_log_dir}/ray-worker-${rank}.exit.log"
-            exit "${ray_rc}"
-        fi
+        kill -0 "${ray_pid}" 2>/dev/null || { wait "${ray_pid}"; exit $?; }
         if [ -n "${gateway_pid}" ] && ! kill -0 "${gateway_pid}" 2>/dev/null; then
             set +e
             wait "${gateway_pid}"
@@ -729,13 +584,9 @@ fi
 WORKER
 chmod +x "${worker_script}"
 
-##############################################################################################
-# Launch Summary
-##############################################################################################
-
 cat <<SUMMARY
 ============================================================
-TMax multi-harness 4B DPPO - fresh 500-step training
+webarea multi-harness SWE-Gym GRPO
   run:       ${run_id}
   nodes:     ${slurm_nodes[*]}
   ray head:  ${ray_head_ip}
@@ -747,60 +598,23 @@ TMax multi-harness 4B DPPO - fresh 500-step training
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
-  harnesses: ${harness_pool} (seed=${harness_seed}, one harness per prompt)
+  harnesses: ${harness_pool} (seed=${harness_seed}, one harness per prompt group)
   output cap:PI=${pi_max_tokens}, Codex=CLI default, Claude=${anthropic_max_tokens}, Qwen Code=${qwen_code_max_output_tokens}
-  scheduling:${resume_mode}, Slurm walltime=4:00:00, training deadline=off, singleton job name=${SLURM_JOB_NAME}
+  idle pulse:after=${train_idle_pulse_after_seconds}s, duration=${train_idle_pulse_duration_seconds}s, matrix=${train_idle_pulse_matrix_size}
+  scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}
   boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id:-checkpoint})
-  stability: lr=${train_lr}, clip=${clip_grad}, per_token=${calculate_per_token_loss}, logprob_diff=${max_train_rollout_logprob_abs_diff}, rollout_ft=${use_fault_tolerance}
-  limits:    async=${polar_max_async_level}, max_steps=${polar_max_steps}, session=${polar_task_timeout_seconds}s, request=${polar_request_timeout}s
+  stability: lr=${train_lr}, KL=${kl_loss_coef}, clip=${clip_grad}, rollout_ft=${use_fault_tolerance}
   W&B:       ${wandb_entity}/${wandb_project}/${wandb_run_id}
 ============================================================
 SUMMARY
 
-##############################################################################################
-# Slurm Job Step
-##############################################################################################
-
-batch_monitor_log="${run_log_dir}/batch-step-monitor.log"
-set +e
-# These are independent Bash/Ray workers, not MPI ranks. Leaving Slurm's
-# default pmix_v4 plugin enabled causes its unused fence to time out after
-# 180 minutes and slurmstepd to cancel an otherwise healthy job step.
+# These workers are independent Bash/Ray processes. Disable PMIx exactly as in
+# the Tmax reference so its unused fence cannot cancel a healthy long job step.
 srun --mpi=none --overlap --kill-on-bad-exit=1 --nodes="${num_nodes}" --ntasks="${num_nodes}" --ntasks-per-node=1 --gres="gpu:${gpus_per_node}" \
-        --cpus-per-task="${ray_num_cpus}" \
-        --container-image="${train_sqsh}" \
-        --container-mounts="${container_mounts}" \
-        --container-workdir="${project_root}" \
-        --container-writable --no-container-mount-home \
-        bash "${worker_script}" &
-srun_pid="$!"
-printf '[%s] srun started pid=%s\n' \
-    "$(date -u +%FT%TZ)" "${srun_pid}" >>"${batch_monitor_log}"
+    --cpus-per-task="${ray_num_cpus}" \
+    --container-image="${train_sqsh}" \
+    --container-mounts="${container_mounts}" \
+    --container-workdir="${project_root}" \
+    --container-writable --no-container-mount-home \
+    bash "${worker_script}"
 
-(
-    while true; do
-        printf 'timestamp=%s host=%s monitor_pid=%s batch_pid=%s srun_pid=%s\n' \
-            "$(date -u +%FT%TZ)" "$(hostname)" "${BASHPID}" "$$" "${srun_pid}"
-        printf '%s\n' 'self cgroup:'
-        cat /proc/self/cgroup 2>/dev/null || true
-        cgroup_rel="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)"
-        if [ -n "${cgroup_rel}" ]; then
-            for metric in memory.events memory.current memory.peak pids.events pids.current; do
-                printf 'cgroup %s: ' "${metric}"
-                cat "/sys/fs/cgroup${cgroup_rel}/${metric}" 2>/dev/null || true
-            done
-        fi
-        ps -o pid,ppid,state,rss,vsz,etimes,comm,args --forest \
-            -p "$$,${srun_pid}" --ppid "$$,${srun_pid}" 2>/dev/null || true
-        sleep 10
-    done
-) >>"${batch_monitor_log}" 2>&1 &
-batch_monitor_pid="$!"
-
-wait "${srun_pid}"
-srun_rc="$?"
-set -e
-kill "${batch_monitor_pid}" 2>/dev/null || true
-wait "${batch_monitor_pid}" 2>/dev/null || true
-printf '[%s] main srun exited rc=%s\n' "$(date -u +%FT%TZ)" "${srun_rc}" >>"${batch_monitor_log}"
-exit "${srun_rc}"
