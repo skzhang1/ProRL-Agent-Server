@@ -136,9 +136,9 @@ rollout_health_check_interval="${rollout_health_check_interval:-30}"
 rollout_health_check_timeout="${rollout_health_check_timeout:-30}"
 rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 
-# Fixed identity shared by checkpoints and W&B. Inherited submit-shell
-# variables cannot redirect this task into another run or checkpoint tree.
-# Use a new script identity when intentionally starting a different experiment.
+# Keep the training/checkpoint identity stable for singleton resume. W&B uses
+# a separate stable ID so replacing a deleted dashboard run never redirects
+# this task into a different checkpoint tree.
 run_label="4n32g-train8-rollout24-tp4dp2-8x8-60k-3gw-2ep-fa4b19-pmerge-k2-multiharness"
 experiment_name="webarea-distill_mh_q35_4n_full293_2ep_tp4dp2_8x8_60k_3gw"
 run_id="${experiment_name}"
@@ -156,7 +156,7 @@ wandb_mode=online
 wandb_entity=hwinf_dcm
 wandb_project=harnessgen
 wandb_group="${run_id}"
-wandb_run_id="${run_id}"
+wandb_run_id="${run_id}_wandb_v2"
 wandb_random_suffix=0
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 
