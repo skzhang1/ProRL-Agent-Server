@@ -525,6 +525,53 @@ if not all(line in text for line in stable_id_lines):
 PY
 }
 
+patch_checkpoint_async_strategy_compat() {
+    # The converted release checkpoint predates Megatron's async_strategy
+    # field.  This Megatron revision otherwise interprets a missing checkpoint
+    # field as nvrx, ignoring the current --async-strategy mcore argument.
+    # Patch only the dedicated Slime clone and redirect that legacy fallback at
+    # runtime; do not modify the shared Megatron checkout or checkpoint files.
+    "${python_bin}" - "${slime_dir}/slime/backends/megatron_utils/checkpoint.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+marker = "# SLIME_NRT_ASYNC_STRATEGY_COMPAT"
+if marker not in text:
+    needle = "from megatron.training.global_vars import get_args\n"
+    if text.count(needle) != 1:
+        raise SystemExit(f"unexpected get_args import in {path}")
+    insertion = needle + """
+
+# SLIME_NRT_ASYNC_STRATEGY_COMPAT
+from megatron.core.dist_checkpointing.strategies import torch as _torch_dist_strategy
+
+_slime_original_get_async_strategy = _torch_dist_strategy.get_async_strategy
+
+
+def _slime_get_async_strategy(async_strategy="nvrx", module=None):
+    # Old converted checkpoints have no async_strategy in their saved args.
+    # Megatron's serialization layer turns that absence into "nvrx". Honor
+    # the current job's explicit mcore choice when nvrx is unavailable.
+    if async_strategy == "nvrx":
+        try:
+            configured_strategy = getattr(get_args(), "async_strategy", None)
+        except (AssertionError, RuntimeError):
+            configured_strategy = None
+        if configured_strategy == "mcore":
+            async_strategy = "mcore"
+    return _slime_original_get_async_strategy(async_strategy, module=module)
+
+
+_torch_dist_strategy.get_async_strategy = _slime_get_async_strategy
+"""
+    text = text.replace(needle, insertion, 1)
+    compile(text, str(path), "exec")
+    path.write_text(text, encoding="utf-8")
+PY
+}
+
 patch_swegym_grpo_compat() {
     # Never patch the shared friend Slime checkout used by Tmax. The dedicated
     # clone under this example inherits its native idle-pulse implementation,
@@ -1367,6 +1414,11 @@ PY
         --load "${load_dir}"
         --save "${save_dir}"
         --dist-ckpt-strictness "${dist_ckpt_strictness:-log_all}"
+        # The NRT training image does not ship nvidia-resiliency-ext.  Recent
+        # Megatron defaults to the nvrx checkpoint reader even when async save
+        # is disabled, so select the built-in reader explicitly for both load
+        # and save/resume.
+        --async-strategy "${async_strategy:-mcore}"
         --save-interval "${save_interval}"
         "${graceful_exit_args[@]}"
         --update-weights-interval 1
@@ -1524,6 +1576,7 @@ ensure_current_checkouts
 SLIME_DIR="${slime_dir}" bash "${project_root}/scripts/patch/patch_slime_megatron_compat.sh"
 patch_swegym_grpo_compat
 patch_wandb_compat
+patch_checkpoint_async_strategy_compat
 patch_container_runtime
 prepare_prompt_data_and_sifs
 prepare_agent_cli
@@ -1537,4 +1590,3 @@ if [ "${dry_run}" = "1" ]; then
 fi
 
 start_services_and_train
-
