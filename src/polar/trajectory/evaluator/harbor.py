@@ -28,12 +28,16 @@ Config schema (:class:`~polar.trajectory.models.EvaluatorSpec.config`)
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from polar.runtime.base import BaseRuntime
 from polar.trajectory.evaluator.base import BaseTrajectoryEvaluator
 from polar.trajectory.models import EvalResult, Trajectory
+
+
+_MAX_PERSISTED_TEST_OUTPUT_CHARS = 64 * 1024
 
 
 class HarborEvaluator(BaseTrajectoryEvaluator):
@@ -89,13 +93,25 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         await rt.exec(f"chmod -R +x {self.tests_target} 2>/dev/null || true", env=eval_env)
 
         # 2. Run the verifier (writes 0/1 to reward.txt, the Harbor contract).
+        verifier_started = time.monotonic()
         result = await rt.exec(self.test_command, env=eval_env, timeout_sec=test_timeout)
+        verifier_duration_seconds = time.monotonic() - verifier_started
         test_output = (result.stdout or "") + (result.stderr or "")
         test_output_path = artifacts_dir / "verifier.stdout.log"
         test_output_path.write_text(test_output)
 
         # 3. Read the reward back, clamped to [0, 1] (mirrors Harbor's reward parsing).
-        reward = await self._read_reward(rt, eval_env)
+        reward, reward_source, reward_raw = await self._read_reward(rt, eval_env)
+        output_truncated = len(test_output) > _MAX_PERSISTED_TEST_OUTPUT_CHARS
+        if output_truncated:
+            half = _MAX_PERSISTED_TEST_OUTPUT_CHARS // 2
+            persisted_output = (
+                test_output[:half]
+                + "\n... verifier output truncated ...\n"
+                + test_output[-half:]
+            )
+        else:
+            persisted_output = test_output
 
         metadata: dict[str, Any] = {
             "mode": self.MODE,
@@ -103,29 +119,40 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
             "reward": reward,
             "verifier_exit_code": result.return_code,
             "verifier_timeout": result.return_code == -1,
+            "verifier_duration_seconds": verifier_duration_seconds,
             "test_output_path": str(test_output_path),
+            "test_output": persisted_output,
+            "test_output_chars": len(test_output),
+            "test_output_truncated": output_truncated,
+            "reward_source": reward_source,
+            "reward_raw": reward_raw,
         }
         return EvalResult(outcome_reward=reward, metadata=metadata)
 
-    async def _read_reward(self, rt: BaseRuntime, env: dict[str, str]) -> float:
+    async def _read_reward(
+        self, rt: BaseRuntime, env: dict[str, str]
+    ) -> tuple[float, str | None, str | None]:
         text = await rt.exec(f"cat {self.verifier_dir}/reward.txt 2>/dev/null", env=env)
         if text.return_code == 0 and (text.stdout or "").strip():
+            raw = text.stdout.strip()
             try:
-                return _clamp(float(text.stdout.strip()))
+                return _clamp(float(raw)), "reward.txt", raw
             except ValueError:
                 pass
         # Fallback: Harbor also accepts a reward.json (scalar or {name: reward}).
         blob = await rt.exec(f"cat {self.verifier_dir}/reward.json 2>/dev/null", env=env)
         if blob.return_code == 0 and (blob.stdout or "").strip():
+            raw = blob.stdout.strip()
             try:
-                data = json.loads(blob.stdout)
+                data = json.loads(raw)
                 if isinstance(data, (int, float)):
-                    return _clamp(float(data))
+                    return _clamp(float(data)), "reward.json", raw
                 if isinstance(data, dict) and data:
-                    return _clamp(sum(float(v) for v in data.values()) / len(data))
+                    reward = sum(float(v) for v in data.values()) / len(data)
+                    return _clamp(reward), "reward.json", raw
             except (ValueError, TypeError):
                 pass
-        return 0.0
+        return 0.0, None, None
 
 
 def _clamp(value: float) -> float:
