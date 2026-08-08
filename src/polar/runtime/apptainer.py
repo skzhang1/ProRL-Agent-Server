@@ -68,7 +68,10 @@ class ApptainerRuntime(BaseRuntime):
         if self._isolate_pid:
             # The deployed patched binary exposes PID isolation through
             # --containall (it does not implement a standalone --pid flag).
-            args.append("--containall")
+            # Keep /tmp on the writable root overlay. Harbor task verifiers
+            # expect Docker semantics where /app and /tmp are on one
+            # filesystem, so rename(2) between them must not fail with EXDEV.
+            args.extend(["--containall", "--no-mount", "tmp"])
         if self.spec.gpus > 0:
             args.append("--nv")
         network_name: str | None
@@ -165,7 +168,7 @@ class ApptainerRuntime(BaseRuntime):
         if self._direct_exec:
             args.extend(["--overlay", str(self._overlay_dir)])
             if self._isolate_pid:
-                args.append("--containall")
+                args.extend(["--containall", "--no-mount", "tmp"])
             if self.spec.gpus > 0:
                 args.append("--nv")
             network_name = "none" if not self.spec.allow_internet else self.spec.network

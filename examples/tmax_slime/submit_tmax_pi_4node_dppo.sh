@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tmax-pi-4b-dppo-s16-500
+#SBATCH --job-name=tmax-pi-4b-n14462-s8-dyn-16k65k
+#SBATCH --account=nvr_lpr_agentic
 #SBATCH --partition=batch_block1
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
@@ -69,11 +70,11 @@ qkv_format="${qkv_format:-thd}"
 use_dynamic_batch_size=1
 use_sequence_parallel=1
 micro_batch_size=1
-global_batch_size=128
+global_batch_size=64
 load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
 rollout_batch_size=8
-n_samples_per_prompt=16
+n_samples_per_prompt=8
 num_epoch=1
 # Slime uses an exclusive boundary: rollout IDs 0..499 are 500 training steps.
 target_num_rollout=500
@@ -100,7 +101,7 @@ train_idle_pulse_matrix_size=2048
 max_tokens_per_gpu=67584
 log_probs_chunk_size=256
 rollout_max_response_len=16384
-rollout_max_prompt_len=32000
+rollout_max_prompt_len=2048
 sglang_context_length=262144
 sglang_mem_fraction_static=0.7
 distributed_timeout_minutes=180
@@ -117,12 +118,8 @@ eps_clip_high=0.28
 eps_clip_c=10.0
 calculate_per_token_loss=1
 max_train_rollout_logprob_abs_diff=0.5
-# The initial 4B PI policy often yields all-zero/all-one groups. Slime's
-# nonzero-std filter retries without a bound, which can leave the actor idle
-# long enough for the cluster reaper to cancel the allocation. Keep all eight
-# 16-sample groups instead: reward centering gives constant-reward groups zero
-# advantage, while mixed-reward groups retain their training signal.
-dynamic_sampling_filter_path=""
+# Require mixed rewards within each 8-sample prompt group before training.
+dynamic_sampling_filter_path="slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std"
 polar_fully_async=1
 polar_early_stop_grace_sessions=4
 polar_max_trajectory_tokens=67584
@@ -135,10 +132,9 @@ polar_max_trajectory_tokens=67584
 agent_harness=pi
 agent_label=pi
 pi_api_type=openai-completions
-# Trigger PI compaction early enough to absorb a large tool result without
-# overshooting SGLang's hard 60k request limit.
-pi_context_window=24000
-pi_max_tokens=512
+# Match the 16K per-turn and 65K cumulative trajectory budget.
+pi_context_window=65536
+pi_max_tokens=16384
 # Compaction creates a clean prefix break; prefix_merging starts a new trace at
 # that boundary instead of turning the session into a context-limit failure.
 pi_fail_on_context_limit=0
@@ -176,15 +172,17 @@ rollout_health_check_first_wait=0
 ##############################################################################################
 
 # Fixed identity: this task cannot inherit an older experiment name or save path.
-run_label="dppo-4n-rb8-s16-500step-v1"
-experiment_name="tmax_pi_4b_dppo_4n_rb8_s16_500step_v1"
+run_label="dppo-4n-n14462-rb8-s8-dyn-16k65k-500step-v1"
+experiment_name="tmax_pi_4b_dppo_4n_n14462_rb8_s8_dyn_16k65k_500step_v1"
 run_id="${experiment_name}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
-run_generation="20260724-dppo-4n-rb8-s16-500step-v1"
+run_generation="20260807-dppo-4n-n14462-rb8-s8-dyn-16k65k-500step-v1"
 rollout_save_dir="${run_dir}/rollout_results"
-full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_ready_prefix256.jsonl"
+full_prompt_data="${project_root}/examples/tmax_slime/data/tmax_train_ready_no_holdout.jsonl"
+full_prompt_data_expected_rows=14462
+full_prompt_data_sha256=689fdfeaa4ca9b2b7f794e6cfdce07bc72725fc3f1dc957265f6377d2a694a79
 prompt_data="${run_dir}/tmax_train.jsonl"
 tmax_dataset_dir="${tmax_dataset_dir:-/lustre/fsw/portfolios/nvr/users/songyangh/bjin_works/agent_world_model/tmax15k/dataset}"
 tmax_image_dir="${tmax_image_dir:-/lustre/fsw/portfolios/nvr/users/songyangh/bjin_works/agent_world_model/tmax15k/sif}"
@@ -237,6 +235,12 @@ job_account="${SLURM_JOB_ACCOUNT:-default}"
 [ -x "${inner_launcher}" ] || die "missing inner launcher: ${inner_launcher}"
 [ -f "${train_sqsh}" ] || die "missing training image: ${train_sqsh}"
 [ -s "${full_prompt_data}" ] || die "missing pre-generated TMax prompt pool: ${full_prompt_data}"
+full_prompt_data_rows="$(awk 'NF { count += 1 } END { print count + 0 }' "${full_prompt_data}")"
+[ "${full_prompt_data_rows}" = "${full_prompt_data_expected_rows}" ] || \
+    die "expected ${full_prompt_data_expected_rows} TMax rows in ${full_prompt_data}; found ${full_prompt_data_rows}"
+full_prompt_data_actual_sha256="$(sha256sum "${full_prompt_data}" | awk '{ print $1 }')"
+[ "${full_prompt_data_actual_sha256}" = "${full_prompt_data_sha256}" ] || \
+    die "TMax prompt SHA256 mismatch for ${full_prompt_data}"
 [ -f "${slime_dir}/train_async.py" ] || die "missing friend Slime: ${slime_dir}"
 [ -f "${polar_project_root}/src/polar/__init__.py" ] || die "missing current-project Polar: ${polar_project_root}/src/polar"
 project_root_real="$(readlink -f "${project_root}")"
@@ -269,10 +273,17 @@ expected_manifest="run_generation=${run_generation}
 project_root=${project_root}
 slime_dir=${slime_dir}
 rollout_batch_size=8
-n_samples_per_prompt=16
-global_batch_size=128
+n_samples_per_prompt=8
+global_batch_size=64
 target_num_rollout=500
-dynamic_sampling_filter=off
+dynamic_sampling_filter=slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+rollout_max_prompt_len=2048
+rollout_max_response_len=16384
+polar_max_trajectory_tokens=67584
+pi_context_window=65536
+pi_max_tokens=16384
+full_prompt_data_rows=14462
+full_prompt_data_sha256=689fdfeaa4ca9b2b7f794e6cfdce07bc72725fc3f1dc957265f6377d2a694a79
 session_timeout_seconds=900
 "
 mkdir -p "${script_dir}/logs/slurm" "${run_log_dir}" "${save_dir}" "${rollout_save_dir}"

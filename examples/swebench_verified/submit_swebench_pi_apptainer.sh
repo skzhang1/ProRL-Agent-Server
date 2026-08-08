@@ -486,7 +486,10 @@ preflight() {
     [ -x "${AGENT_CLI_DIR}/bin/${agent_bin}" ] || \
         die "${AGENT_HARNESS} CLI not found under AGENT_CLI_DIR: ${AGENT_CLI_DIR}/bin/${agent_bin}"
     [ -x "${POLAR_APPTAINER_BIN}" ] || die "patched Apptainer not found: ${POLAR_APPTAINER_BIN}"
-    [ "${SLURM_JOB_PARTITION:-interactive}" = "interactive" ] || die "eval is restricted to the interactive partition"
+    case "${SLURM_JOB_PARTITION:-interactive}" in
+        interactive|batch_block1) ;;
+        *) die "eval is restricted to the interactive or batch_block1 partition" ;;
+    esac
     [ "${SLURM_JOB_NUM_NODES:-1}" -le 1 ] || die "each eval shard must use exactly one node"
     [ "${TOTAL_GPUS}" -ge 2 ] || die "TOTAL_GPUS must be at least 2"
     if [ "${EVAL_COLOCATE}" = "1" ]; then
@@ -1025,13 +1028,15 @@ def safe_load_session(path: Path) -> tuple[dict | None, str | None]:
 
 
 def collect_sessions() -> dict[str, list[Path]]:
+    longest_first = sorted(instance_ids, key=len, reverse=True)
     by_instance: dict[str, list[Path]] = {iid: [] for iid in instance_ids}
     if not rollout_dir.exists():
         return by_instance
     for path in rollout_dir.rglob("ses_*.json"):
-        path_text = path.as_posix()
-        for iid in instance_ids:
-            if iid in path_text:
+        session, _ = safe_load_session(path)
+        task_text = str((session or {}).get("task_id") or path.as_posix())
+        for iid in longest_first:
+            if iid in task_text:
                 by_instance[iid].append(path)
                 break
     for paths in by_instance.values():
