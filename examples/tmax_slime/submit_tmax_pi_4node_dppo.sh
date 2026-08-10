@@ -210,6 +210,7 @@ dry_run=0
 port_slot=$((SLURM_JOB_ID % 1000))
 rollout_port=$((18000 + port_slot))
 gateway_port=$((20000 + port_slot))
+sglang_router_port=$((26000 + port_slot))
 ray_port="${ray_port:-6379}"
 ray_dashboard_port="${ray_dashboard_port:-28265}"
 ray_num_cpus=128
@@ -464,7 +465,7 @@ export polar_gateway_max_restarts
 export polar_runtime_memory_mb polar_task_timeout_seconds polar_max_steps polar_request_timeout
 export polar_task_timeout_from_metadata
 export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
-export rollout_port gateway_port
+export rollout_port gateway_port sglang_router_port
 export run_id run_label run_dir run_log_dir save_dir rollout_save_dir run_generation
 export full_prompt_data prompt_data tmax_dataset_dir tmax_image_dir
 export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key

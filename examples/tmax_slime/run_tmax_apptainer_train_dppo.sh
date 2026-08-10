@@ -309,7 +309,7 @@ pi_provider_max_retries="${pi_provider_max_retries:-0}"
 
 rollout_port="${rollout_port:-18080}"
 gateway_port="${gateway_port:-18100}"
-sglang_router_port="${sglang_router_port:-26000}"
+sglang_router_port="${sglang_router_port:-$((26000 + ${SLURM_JOB_ID:-0} % 1000))}"
 slime_sglang_base_port="${slime_sglang_base_port:-34000}"
 ray_port="${ray_port:-6379}"
 ray_dashboard_port="${ray_dashboard_port:-28265}"
