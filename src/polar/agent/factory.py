@@ -14,6 +14,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
     from polar.agent.presets.gemini_cli import GeminiCliHarness
     from polar.agent.presets.hermes import HermesHarness
     from polar.agent.presets.mini_swe_agent import MiniSweAgentHarness
+    from polar.agent.presets.nanobot import NanobotHarness
     from polar.agent.presets.openclaw import OpenClawHarness
     from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
     from polar.agent.presets.opencode import OpenCodeHarness
@@ -27,6 +28,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
         "gemini_cli": GeminiCliHarness,
         "hermes": HermesHarness,
         "mini_swe_agent": MiniSweAgentHarness,
+        "nanobot": NanobotHarness,
         "openclaw": OpenClawHarness,
         "openhands_sdk": OpenHandsSdkHarness,
         "opencode": OpenCodeHarness,
