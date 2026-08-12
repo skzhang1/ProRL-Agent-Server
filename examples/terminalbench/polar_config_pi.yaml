@@ -1,0 +1,73 @@
+polar_rollout_url: "http://127.0.0.1:18080"
+polar_gateway_url: "http://127.0.0.1:18100"
+polar_reward_key: "score"
+polar_max_async_level: 1
+polar_request_timeout: 1800
+polar_callback_host: "127.0.0.1"
+polar_min_complete_accept_fraction: 0.0
+polar_max_trajectory_tokens: 67584
+polar_eval_dataset_name: "terminal_bench_2_1"
+polar_agent_cli_dir: "tmp/swegym_agent_cli/opt_node"
+polar_apptainer_image_dir: "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_vision/users/shaokunz/HarnessGen/terminal_bench_sif"
+
+polar_task_template:
+  timeout_seconds: 1500
+  max_steps: 160
+  runtime:
+    backend: "apptainer"
+    image: "{sample.metadata.sif_path}"
+    network: "host"
+    allow_internet: "{sample.metadata.allow_internet}"
+    workdir: "{sample.metadata.workdir}"
+    memory_mb: "{sample.metadata.memory_mb}"
+    direct_exec_init_command: >-
+      if [ -f /.singularity.d/env/99-rogue.sh ]; then
+        . /.singularity.d/env/99-rogue.sh;
+      fi
+    env:
+      HOME: "/polar/session/home"
+      PATH: "/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    kwargs:
+      volumes:
+        - "{args.polar_agent_cli_dir}:/opt/node:ro"
+    prepare:
+      - type: exec
+        cwd: "/"
+        command: >-
+          mkdir -p "$HOME/.pi/agent" /polar/session/logs/agent &&
+          printf '%s' 'eyJjb21wYWN0aW9uIjp7ImVuYWJsZWQiOnRydWV9LCJyZXRyeSI6eyJlbmFibGVkIjp0cnVlLCJtYXhSZXRyaWVzIjowLCJwcm92aWRlciI6eyJtYXhSZXRyaWVzIjowfX19' | base64 -d > "$HOME/.pi/agent/settings.json" &&
+          if command -v git >/dev/null 2>&1; then git config --global core.pager ''; fi
+  agent:
+    harness: "pi"
+    model_name: "openai/Qwen/Qwen3.5-4B"
+    settings:
+      api_type: "openai-completions"
+      context_window: 65536
+      max_tokens: 16384
+      compat:
+        maxTokensField: "max_tokens"
+  builder:
+    strategy: "prefix_merging"
+  evaluator:
+    strategy: "harbor"
+    refresh_runtime: false
+    config:
+      tests_dir: "{sample.metadata.tests_dir}"
+      tests_target: "/polar/session/tests"
+      verifier_dir: "/polar/session/logs/verifier"
+      test_command: >-
+        rm -rf /tests /logs/verifier &&
+        mkdir -p /logs &&
+        ln -s /polar/session/tests /tests &&
+        ln -s /polar/session/logs/verifier /logs/verifier &&
+        printf 'APT::Sandbox::User "root";\n' > /polar/session/apt.conf &&
+        APT_CONFIG=/polar/session/apt.conf
+        bash /tests/test.sh
+      verifier_timeout: "{sample.metadata.verifier_timeout}"
+
+polar_task_id_template: "polar-terminalbench21-{sample.metadata.instance_id}-{rollout_id}-{sample.group_index}"
