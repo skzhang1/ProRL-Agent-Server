@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from slime_bridge.config import (
+    AdaptiveHarnessSampler,
     render_instruction,
     render_task_payload,
     render_topology_template,
@@ -252,3 +253,112 @@ gateway:
     node = rendered["gateway"]["nodes"][0]
     assert node["inference"] == {"engine": "sglang", "base_url": "http://127.0.0.1:30000"}
     assert "sglang" not in node
+
+
+
+def test_hapo_sampler_updates_toward_the_harder_harness() -> None:
+    pool = (
+        {"harness": "pi", "model_name": "openai/model"},
+        {"harness": "codex", "model_name": "model"},
+    )
+    sampler = AdaptiveHarnessSampler(
+        pool,
+        seed=17,
+        epsilon=0.2,
+        learning_rate=0.1,
+        correct_threshold=0.5,
+    )
+
+    assert sampler.learned_probabilities() == pytest.approx([0.5, 0.5])
+    metrics = sampler.update([("pi", True)] * 4 + [("codex", False)] * 4)
+
+    learned = sampler.learned_probabilities()
+    sampled = sampler.sampling_probabilities()
+    assert learned[1] > learned[0]
+    assert sampled[1] > sampled[0]
+    assert min(sampled) >= 0.1 - 1e-12
+    assert sum(sampled) == pytest.approx(1.0)
+    assert metrics["polar/hapo/pi/accuracy"] == 1.0
+    assert metrics["polar/hapo/codex/accuracy"] == 0.0
+    assert metrics["polar/hapo/codex/relative_difficulty"] > 0.0
+
+
+def test_hapo_relative_difficulty_uses_unweighted_harness_mean() -> None:
+    pool = (
+        {"harness": "pi", "model_name": "openai/model"},
+        {"harness": "codex", "model_name": "model"},
+        {"harness": "claude_code", "model_name": "model"},
+    )
+    sampler = AdaptiveHarnessSampler(
+        pool,
+        seed=17,
+        epsilon=0.2,
+        learning_rate=0.1,
+        correct_threshold=0.5,
+    )
+    sampler.logits = [4.0, 0.0, -4.0]
+
+    metrics = sampler.update(
+        [("pi", True), ("codex", False), ("claude_code", False)]
+    )
+
+    assert metrics["polar/hapo/expected_difficulty"] == pytest.approx(2.0 / 3.0)
+    assert metrics["polar/hapo/pi/relative_difficulty"] == pytest.approx(-2.0 / 3.0)
+    assert metrics["polar/hapo/codex/relative_difficulty"] == pytest.approx(1.0 / 3.0)
+
+
+def test_hapo_sampler_state_round_trips_and_sampling_is_reproducible() -> None:
+    pool = (
+        {"harness": "pi", "model_name": "openai/model"},
+        {"harness": "codex", "model_name": "model"},
+        {"harness": "claude_code", "model_name": "model"},
+    )
+    sampler = AdaptiveHarnessSampler(
+        pool,
+        seed=87,
+        epsilon=0.3,
+        learning_rate=0.1,
+        correct_threshold=0.5,
+    )
+    sampler.update([("pi", True), ("codex", False), ("claude_code", False)])
+
+    restored = AdaptiveHarnessSampler(
+        pool,
+        seed=87,
+        epsilon=0.3,
+        learning_rate=0.1,
+        correct_threshold=0.5,
+        state=sampler.state_dict(),
+    )
+
+    assert restored.state_dict() == sampler.state_dict()
+    assert [restored.sample_agent(i) for i in range(20)] == [
+        sampler.sample_agent(i) for i in range(20)
+    ]
+
+
+def test_resolve_polar_slime_config_validates_hapo_parameters() -> None:
+    config = resolve_polar_slime_config(
+        _args(
+            polar_harness_pool=[{"harness": "pi"}, {"harness": "codex"}],
+            polar_harness_sampling_strategy="hapo",
+            polar_hapo_epsilon=0.3,
+            polar_hapo_learning_rate=0.1,
+            polar_hapo_correct_threshold=0.5,
+        )
+    )
+    assert config.harness_sampling_strategy == "hapo"
+    assert config.hapo_epsilon == 0.3
+
+    with pytest.raises(ValueError, match="requires polar_harness_pool"):
+        resolve_polar_slime_config(
+            _args(polar_harness_sampling_strategy="hapo")
+        )
+    with pytest.raises(ValueError, match="polar_hapo_epsilon"):
+        resolve_polar_slime_config(
+            _args(
+                polar_harness_pool=[{"harness": "pi"}],
+                polar_harness_sampling_strategy="hapo",
+                polar_hapo_epsilon=1.0,
+            )
+        )

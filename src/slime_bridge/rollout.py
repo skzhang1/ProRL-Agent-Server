@@ -33,6 +33,8 @@ from polar.rollout.models import TaskResult, TaskStatus
 from slime_bridge._messages import prompt_to_instruction_text
 from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
 from slime_bridge.config import (
+    HAPO_STATE_METADATA_KEY,
+    AdaptiveHarnessSampler,
     PolarSlimeConfig,
     render_instruction,
     render_task_payload,
@@ -114,6 +116,7 @@ def _build_task_payload(
     group: list[Any],
     rollout_id: int,
     task_position: int,
+    harness_sampler: AdaptiveHarnessSampler | None = None,
 ) -> dict[str, Any]:
     first_sample = group[0]
     prompt_text = prompt_to_instruction_text(getattr(first_sample, "prompt", ""))
@@ -134,6 +137,7 @@ def _build_task_payload(
         rollout_id=rollout_id,
         task_position=task_position,
         num_rollouts=len(group),
+        harness_sampler=harness_sampler,
     )
     harness = (payload.get("metadata") or {}).get("harness")
     if harness:
@@ -387,6 +391,28 @@ class AsyncPolarRolloutWorker:
         self.args = args
         self.data_source = data_source
         self.config = resolve_polar_slime_config(args)
+        self.harness_sampler: AdaptiveHarnessSampler | None = None
+        if self.config.harness_sampling_strategy == "hapo":
+            metadata_getter = getattr(data_source, "get_metadata", None)
+            metadata = metadata_getter() if callable(metadata_getter) else getattr(
+                data_source, "metadata", {}
+            )
+            if not isinstance(metadata, dict):
+                raise ValueError("Slime data-source metadata must be a mapping for HAPO")
+            state = metadata.get(HAPO_STATE_METADATA_KEY)
+            self.harness_sampler = AdaptiveHarnessSampler(
+                self.config.harness_pool,
+                seed=self.config.harness_seed,
+                epsilon=self.config.hapo_epsilon,
+                learning_rate=self.config.hapo_learning_rate,
+                correct_threshold=self.config.hapo_correct_threshold,
+                state=state,
+            )
+            logger.info(
+                "Initialized HAPO sampler (restored=%s, updates=%d)",
+                state is not None,
+                self.harness_sampler.update_steps,
+            )
         batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
         # Output queue is a handoff channel; the durable overflow buffer is
         # `_completed_buffer`, which is drained in bounded chunks by training.
@@ -686,6 +712,7 @@ class AsyncPolarRolloutWorker:
         payload = _build_task_payload(
             args=self.args, config=self.config, group=pending.group,
             rollout_id=pending.group_id, task_position=0,
+            harness_sampler=self.harness_sampler,
         )
         payload["task_id"] = str(payload["task_id"])
         _attach_scheduler_metadata(
@@ -1236,7 +1263,57 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = {}
     metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
+    metrics.update(_update_hapo_sampler(async_worker, flat))
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
+
+
+def _update_hapo_sampler(
+    worker: AsyncPolarRolloutWorker,
+    samples: list[Any],
+) -> dict[str, float]:
+    """Update HAPO once per accepted rollout batch using unique sessions."""
+    sampler = worker.harness_sampler
+    if sampler is None:
+        return {}
+
+    outcomes_by_session: dict[str, tuple[str, bool]] = {}
+    for sample in samples:
+        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar") or {}
+        session_id = polar_meta.get("session_id")
+        harness = polar_meta.get("harness")
+        if not session_id or not harness:
+            raise ValueError(
+                "HAPO samples must carry polar session_id and harness metadata"
+            )
+        reward = _extract_sample_reward(sample, worker.config.reward_key)
+        correct = (
+            _sample_session_status(sample) == "COMPLETED"
+            and not bool(polar_meta.get("placeholder"))
+            and reward >= sampler.correct_threshold
+        )
+        outcome = (str(harness), correct)
+        previous = outcomes_by_session.setdefault(str(session_id), outcome)
+        if previous != outcome:
+            raise ValueError(
+                f"Inconsistent HAPO outcome across traces for session {session_id}"
+            )
+
+    metrics = sampler.update(list(outcomes_by_session.values()))
+    state = sampler.state_dict()
+    metadata_updater = getattr(worker.data_source, "update_metadata", None)
+    if callable(metadata_updater):
+        metadata_updater({HAPO_STATE_METADATA_KEY: state})
+    else:
+        metadata = getattr(worker.data_source, "metadata", None)
+        if not isinstance(metadata, dict):
+            raise ValueError("Slime data-source metadata must be mutable for HAPO")
+        metadata[HAPO_STATE_METADATA_KEY] = state
+    logger.info(
+        "Updated HAPO sampler from %d unique sessions (step=%d)",
+        len(outcomes_by_session),
+        sampler.update_steps,
+    )
+    return metrics
 
 
 def _maybe_dump_longest_trace_artifact(

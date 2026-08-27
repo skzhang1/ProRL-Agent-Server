@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import random
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,7 @@ from polar.agent.models import AgentSpec
 from polar.config import TopologyConfig
 
 _PLACEHOLDER_RE = re.compile(r"{([^{}]+)}")
+HAPO_STATE_METADATA_KEY = "polar_hapo_sampler"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +25,10 @@ class PolarSlimeConfig:
     task_template: dict[str, Any]
     harness_pool: tuple[dict[str, Any], ...]
     harness_seed: int
+    harness_sampling_strategy: str
+    hapo_epsilon: float
+    hapo_learning_rate: float
+    hapo_correct_threshold: float
     task_id_template: str
     instruction_template: str | None
     reward_key: str
@@ -39,6 +45,185 @@ class PolarSlimeConfig:
     tokenizer_name_or_path: str | None
     add_generation_prompt: bool
     eval_dataset_name: str
+
+
+class AdaptiveHarnessSampler:
+    """Cumulative-accuracy harness policy described in ``doc/hapo.md``."""
+
+    _STATE_VERSION = 1
+
+    def __init__(
+        self,
+        harness_pool: tuple[dict[str, Any], ...],
+        *,
+        seed: int,
+        epsilon: float,
+        learning_rate: float,
+        correct_threshold: float,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        if not harness_pool:
+            raise ValueError("HAPO requires a non-empty harness pool")
+        self.harness_pool = harness_pool
+        self.harnesses = tuple(
+            str(spec.get("harness") or spec.get("import_path"))
+            for spec in harness_pool
+        )
+        self._index = {name: index for index, name in enumerate(self.harnesses)}
+        self.seed = int(seed)
+        self.epsilon = float(epsilon)
+        self.learning_rate = float(learning_rate)
+        self.correct_threshold = float(correct_threshold)
+        self._lock = threading.RLock()
+        self.logits = [0.0] * len(self.harnesses)
+        self.sample_counts = [0] * len(self.harnesses)
+        self.correct_counts = [0] * len(self.harnesses)
+        self.update_steps = 0
+        if state is not None:
+            self.load_state_dict(state)
+
+    def sample_agent(self, group_index: int) -> dict[str, Any]:
+        """Sample reproducibly from the current mixed policy."""
+        with self._lock:
+            probabilities = self.sampling_probabilities()
+            draw = random.Random(f"{self.seed}:{int(group_index)}").random()
+            cumulative = 0.0
+            selected = len(probabilities) - 1
+            for index, probability in enumerate(probabilities):
+                cumulative += probability
+                if draw < cumulative:
+                    selected = index
+                    break
+            return deepcopy(self.harness_pool[selected])
+
+    def learned_probabilities(self) -> list[float]:
+        with self._lock:
+            maximum = max(self.logits)
+            weights = [math.exp(value - maximum) for value in self.logits]
+            total = sum(weights)
+            return [weight / total for weight in weights]
+
+    def sampling_probabilities(self) -> list[float]:
+        with self._lock:
+            learned = self.learned_probabilities()
+            floor = self.epsilon / len(learned)
+            return [(1.0 - self.epsilon) * value + floor for value in learned]
+
+    def update(self, outcomes: list[tuple[str, bool]]) -> dict[str, float]:
+        """Update cumulative accuracy and take one policy-gradient SGD step."""
+        if not outcomes:
+            raise ValueError("HAPO update requires at least one harness outcome")
+        with self._lock:
+            batch_sampled = [0] * len(self.harnesses)
+            batch_correct = [0] * len(self.harnesses)
+            for harness, correct in outcomes:
+                try:
+                    index = self._index[harness]
+                except KeyError as exc:
+                    raise ValueError(f"HAPO outcome has unknown harness: {harness}") from exc
+                batch_sampled[index] += 1
+                batch_correct[index] += int(bool(correct))
+
+            for index in range(len(self.harnesses)):
+                self.sample_counts[index] += batch_sampled[index]
+                self.correct_counts[index] += batch_correct[index]
+
+            accuracies = [
+                correct / sampled if sampled else 0.0
+                for sampled, correct in zip(self.sample_counts, self.correct_counts)
+            ]
+            difficulties = [1.0 - accuracy for accuracy in accuracies]
+            learned_before = self.learned_probabilities()
+            expected_difficulty = sum(difficulties) / len(difficulties)
+            advantages = [
+                difficulty - expected_difficulty for difficulty in difficulties
+            ]
+
+            batch_size = len(outcomes)
+            loss = -sum(
+                count * advantages[index] * math.log(max(learned_before[index], 1e-12))
+                for index, count in enumerate(batch_sampled)
+            ) / batch_size
+            weighted_advantage = sum(
+                count * advantages[index]
+                for index, count in enumerate(batch_sampled)
+            ) / batch_size
+            gradients = [
+                learned_before[index] * weighted_advantage
+                - batch_sampled[index] * advantages[index] / batch_size
+                for index in range(len(self.harnesses))
+            ]
+            self.logits = [
+                value - self.learning_rate * gradient
+                for value, gradient in zip(self.logits, gradients)
+            ]
+            # Softmax is shift invariant. Recentering prevents drift on long runs.
+            mean_logit = sum(self.logits) / len(self.logits)
+            self.logits = [value - mean_logit for value in self.logits]
+            self.update_steps += 1
+
+            learned_after = self.learned_probabilities()
+            sampled_after = self.sampling_probabilities()
+            entropy = -sum(
+                probability * math.log(max(probability, 1e-12))
+                for probability in sampled_after
+            )
+            metrics: dict[str, float] = {
+                "polar/hapo/loss": float(loss),
+                "polar/hapo/entropy": float(entropy),
+                "polar/hapo/expected_difficulty": float(expected_difficulty),
+                "polar/hapo/update_steps": float(self.update_steps),
+            }
+            for index, harness in enumerate(self.harnesses):
+                name = re.sub(r"[^A-Za-z0-9_.-]+", "_", harness)
+                prefix = f"polar/hapo/{name}"
+                metrics[f"{prefix}/batch_sampled"] = float(batch_sampled[index])
+                metrics[f"{prefix}/batch_correct"] = float(batch_correct[index])
+                metrics[f"{prefix}/sampled"] = float(self.sample_counts[index])
+                metrics[f"{prefix}/correct"] = float(self.correct_counts[index])
+                metrics[f"{prefix}/accuracy"] = float(accuracies[index])
+                metrics[f"{prefix}/difficulty"] = float(difficulties[index])
+                metrics[f"{prefix}/relative_difficulty"] = float(advantages[index])
+                metrics[f"{prefix}/learned_probability"] = float(learned_after[index])
+                metrics[f"{prefix}/sampling_probability"] = float(sampled_after[index])
+            return metrics
+
+    def state_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "version": self._STATE_VERSION,
+                "harnesses": list(self.harnesses),
+                "logits": list(self.logits),
+                "sample_counts": list(self.sample_counts),
+                "correct_counts": list(self.correct_counts),
+                "update_steps": self.update_steps,
+            }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("HAPO checkpoint state must be a mapping")
+        if int(state.get("version", -1)) != self._STATE_VERSION:
+            raise ValueError(f"Unsupported HAPO checkpoint version: {state.get('version')}")
+        if tuple(state.get("harnesses", ())) != self.harnesses:
+            raise ValueError(
+                "HAPO checkpoint harness order does not match the configured pool"
+            )
+        size = len(self.harnesses)
+        logits = [float(value) for value in state.get("logits", ())]
+        sampled = [int(value) for value in state.get("sample_counts", ())]
+        correct = [int(value) for value in state.get("correct_counts", ())]
+        if not all(len(values) == size for values in (logits, sampled, correct)):
+            raise ValueError("HAPO checkpoint vector length does not match harness pool")
+        if any(not math.isfinite(value) for value in logits):
+            raise ValueError("HAPO checkpoint logits must be finite")
+        if any(value < 0 for value in sampled + correct):
+            raise ValueError("HAPO checkpoint counts must be non-negative")
+        if any(c > n for c, n in zip(correct, sampled)):
+            raise ValueError("HAPO correct count cannot exceed sampled count")
+        self.logits = logits
+        self.sample_counts = sampled
+        self.correct_counts = correct
+        self.update_steps = int(state.get("update_steps", 0))
 
 
 def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
@@ -87,6 +272,27 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
                 spec.model_dump(mode="python", exclude_defaults=True, exclude_none=True)
             )
         harness_pool = tuple(validated_pool)
+
+    harness_sampling_strategy = str(
+        getattr(args, "polar_harness_sampling_strategy", "uniform")
+    ).strip().lower()
+    if harness_sampling_strategy not in {"uniform", "hapo"}:
+        raise ValueError(
+            "polar_harness_sampling_strategy must be 'uniform' or 'hapo'"
+        )
+    if harness_sampling_strategy == "hapo" and not harness_pool:
+        raise ValueError("HAPO sampling requires polar_harness_pool")
+    hapo_epsilon = float(getattr(args, "polar_hapo_epsilon", 0.30))
+    if not 0.0 <= hapo_epsilon < 1.0:
+        raise ValueError("polar_hapo_epsilon must be in [0, 1)")
+    hapo_learning_rate = float(getattr(args, "polar_hapo_learning_rate", 0.10))
+    if not math.isfinite(hapo_learning_rate) or hapo_learning_rate <= 0.0:
+        raise ValueError("polar_hapo_learning_rate must be finite and greater than 0")
+    hapo_correct_threshold = float(
+        getattr(args, "polar_hapo_correct_threshold", 0.50)
+    )
+    if not math.isfinite(hapo_correct_threshold):
+        raise ValueError("polar_hapo_correct_threshold must be finite")
 
     max_async_level = int(getattr(args, "polar_max_async_level", 2))
     if max_async_level <= 0:
@@ -152,6 +358,10 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
             )
             or 0
         ),
+        harness_sampling_strategy=harness_sampling_strategy,
+        hapo_epsilon=hapo_epsilon,
+        hapo_learning_rate=hapo_learning_rate,
+        hapo_correct_threshold=hapo_correct_threshold,
         task_id_template=str(
             getattr(args, "polar_task_id_template", "polar-slime-{rollout_id}-{sample.group_index}")
         ),
@@ -194,6 +404,7 @@ def render_task_payload(
     rollout_id: int,
     task_position: int,
     num_rollouts: int,
+    harness_sampler: AdaptiveHarnessSampler | None = None,
 ) -> dict[str, Any]:
     context = _build_context(
         args=args,
@@ -213,11 +424,14 @@ def render_task_payload(
             raise ValueError(
                 "multi-harness sampling requires sample.group_index"
             )
-        agent = deepcopy(
-            random.Random(f"{config.harness_seed}:{int(group_index)}").choice(
-                config.harness_pool
+        if harness_sampler is None:
+            agent = deepcopy(
+                random.Random(f"{config.harness_seed}:{int(group_index)}").choice(
+                    config.harness_pool
+                )
             )
-        )
+        else:
+            agent = harness_sampler.sample_agent(int(group_index))
         payload["agent"] = agent
         metadata = payload.setdefault("metadata", {})
         if not isinstance(metadata, dict):

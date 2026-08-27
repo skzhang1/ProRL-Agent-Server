@@ -25,27 +25,30 @@ DEFAULT_CACHE_DIR = PROJECT_ROOT / "tmp" / "apptainer_cache"
 DEFAULT_TMP_DIR = PROJECT_ROOT / "tmp" / "apptainer_tmp"
 DEFAULT_AGENT_CLI_DIR = PROJECT_ROOT / "tmp" / "swegym_agent_cli" / "opt_node"
 NODE_VERSION = "22.11.0"
-NODE_DIST_URL = (
-    f"https://nodejs.org/dist/v{NODE_VERSION}/"
-    f"node-v{NODE_VERSION}-linux-x64.tar.xz"
-)
-AGENT_CLI_PACKAGES = (
-    "@openai/codex@latest",
-    "@anthropic-ai/claude-code@latest",
-    "@qwen-code/qwen-code@latest",
-    "opencode-ai@latest",
-    "@mariozechner/pi-coding-agent@latest",
-)
-REQUIRED_AGENT_BINS = (
-    "node",
-    "npm",
-    "npx",
-    "codex",
-    "claude",
-    "qwen",
-    "opencode",
-    "pi",
-)
+OPENCLAW_NODE_VERSION = "24.15.0"
+DEFAULT_HARNESSES = ("codex", "claude_code", "qwen_code", "opencode", "pi")
+NPM_PACKAGE_BY_HARNESS = {
+    "codex": "@openai/codex@latest",
+    "claude_code": "@anthropic-ai/claude-code@latest",
+    "qwen_code": "@qwen-code/qwen-code@latest",
+    "opencode": "opencode-ai@latest",
+    "pi": "@mariozechner/pi-coding-agent@latest",
+    "openclaw": "openclaw@2026.5.27",
+}
+PYTHON_PACKAGE_BY_HARNESS = {
+    "mini_swe_agent": "mini-swe-agent==2.4.2",
+    "nanobot": "nanobot-ai==0.2.2",
+}
+BIN_BY_HARNESS = {
+    "codex": "codex",
+    "claude_code": "claude",
+    "qwen_code": "qwen",
+    "opencode": "opencode",
+    "pi": "pi",
+    "openclaw": "openclaw",
+    "mini_swe_agent": "mini-swe-agent",
+    "nanobot": "nanobot",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -230,15 +233,26 @@ def run_command(command: list[str], *, env: dict[str, str] | None = None) -> Non
     subprocess.run(command, check=True, env=env)
 
 
-def _agent_cli_missing_bins(agent_cli_dir: Path) -> list[str]:
+def _agent_cli_missing_bins(agent_cli_dir: Path, harnesses: tuple[str, ...]) -> list[str]:
+    required = ("node", "npm", "npx", *(BIN_BY_HARNESS[name] for name in harnesses))
     return [
-        name for name in REQUIRED_AGENT_BINS
+        name for name in required
         if not (agent_cli_dir / "bin" / name).is_file()
     ]
 
 
-def ensure_agent_cli_dir(agent_cli_dir: Path, *, force: bool) -> None:
-    missing_bins = _agent_cli_missing_bins(agent_cli_dir)
+def ensure_agent_cli_dir(
+    agent_cli_dir: Path,
+    *,
+    force: bool,
+    harnesses: tuple[str, ...] = DEFAULT_HARNESSES,
+) -> None:
+    unknown = sorted(set(harnesses) - set(BIN_BY_HARNESS))
+    if unknown:
+        raise ValueError(f"Unsupported harness CLI bundle entries: {unknown}")
+    if len(harnesses) != len(set(harnesses)):
+        raise ValueError(f"Duplicate harness CLI bundle entries: {harnesses}")
+    missing_bins = _agent_cli_missing_bins(agent_cli_dir, harnesses)
     if not missing_bins and not force:
         print(f"Shared agent CLI directory already exists: {agent_cli_dir}")
         return
@@ -249,11 +263,16 @@ def ensure_agent_cli_dir(agent_cli_dir: Path, *, force: bool) -> None:
         shutil.rmtree(agent_cli_dir)
     agent_cli_dir.mkdir(parents=True)
 
+    node_version = OPENCLAW_NODE_VERSION if "openclaw" in harnesses else NODE_VERSION
+    node_dist_url = (
+        f"https://nodejs.org/dist/v{node_version}/"
+        f"node-v{node_version}-linux-x64.tar.xz"
+    )
     run_command([
         "bash",
         "-c",
         (
-            f"curl -fsSL {shlex.quote(NODE_DIST_URL)} | "
+            f"curl -fsSL {shlex.quote(node_dist_url)} | "
             f"tar -xJ --strip-components=1 -C {shlex.quote(str(agent_cli_dir))}"
         ),
     ])
@@ -263,20 +282,101 @@ def ensure_agent_cli_dir(agent_cli_dir: Path, *, force: bool) -> None:
         **os.environ,
         "PATH": f"{agent_cli_dir / 'bin'}:{os.environ.get('PATH', '')}",
     }
-    run_command(
-        [
-            str(npm_bin),
-            "install",
-            "-g",
-            "--no-audit",
-            "--no-fund",
-            f"--prefix={agent_cli_dir}",
-            *AGENT_CLI_PACKAGES,
-        ],
-        env=env,
-    )
+    npm_packages = [
+        NPM_PACKAGE_BY_HARNESS[name]
+        for name in harnesses
+        if name in NPM_PACKAGE_BY_HARNESS
+    ]
+    if npm_packages:
+        run_command(
+            [
+                str(npm_bin),
+                "install",
+                "-g",
+                "--no-audit",
+                "--no-fund",
+                f"--prefix={agent_cli_dir}",
+                *npm_packages,
+            ],
+            env=env,
+        )
 
-    missing_bins = _agent_cli_missing_bins(agent_cli_dir)
+    python_packages = [
+        PYTHON_PACKAGE_BY_HARNESS[name]
+        for name in harnesses
+        if name in PYTHON_PACKAGE_BY_HARNESS
+    ]
+    if python_packages:
+        uv_bin = agent_cli_dir / "bin" / "uv"
+        uv_install_env = {
+            **env,
+            "UV_INSTALL_DIR": str(agent_cli_dir / "bin"),
+            "UV_NO_MODIFY_PATH": "1",
+        }
+        run_command(
+            [
+                "bash",
+                "-c",
+                "curl -LsSf https://astral.sh/uv/0.8.13/install.sh | sh",
+            ],
+            env=uv_install_env,
+        )
+        python_install_dir = agent_cli_dir / "python"
+        uv_env = {
+            **env,
+            "UV_PYTHON_INSTALL_DIR": str(python_install_dir),
+        }
+        run_command([str(uv_bin), "python", "install", "3.12.11"], env=uv_env)
+        python_path = Path(
+            subprocess.check_output(
+                [str(uv_bin), "python", "find", "3.12.11", "--python-preference", "only-managed"],
+                env=uv_env,
+                text=True,
+            ).strip()
+        )
+        venv_dir = agent_cli_dir / "python-env"
+        run_command(
+            [str(uv_bin), "venv", "--python", str(python_path), str(venv_dir)],
+            env=uv_env,
+        )
+        python_path = venv_dir / "bin" / "python"
+        run_command(
+            [str(uv_bin), "pip", "install", "--python", str(python_path), *python_packages],
+            env=uv_env,
+        )
+
+        # uv records absolute build-host paths in both the venv interpreter
+        # symlink and console-script shebangs.  The bundle is mounted at
+        # /opt/node in task containers, so make the interpreter relocatable
+        # and invoke console scripts explicitly through it below.
+        managed_python_relative = os.path.relpath(python_path.resolve(), python_path.parent)
+        python_path.unlink()
+        python_path.symlink_to(managed_python_relative)
+        pyvenv_cfg = venv_dir / "pyvenv.cfg"
+        pyvenv_cfg.write_text(
+            pyvenv_cfg.read_text(encoding="utf-8").replace(
+                str(agent_cli_dir), "/opt/node"
+            ),
+            encoding="utf-8",
+        )
+        for harness in harnesses:
+            if harness not in PYTHON_PACKAGE_BY_HARNESS:
+                continue
+            binary = BIN_BY_HARNESS[harness]
+            installed_binary = python_path.parent / binary
+            if not installed_binary.is_file():
+                raise RuntimeError(f"Python tool install did not create {installed_binary}")
+            relative_binary = installed_binary.relative_to(agent_cli_dir)
+            relative_python = python_path.relative_to(agent_cli_dir)
+            wrapper = agent_cli_dir / "bin" / binary
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f'exec "/opt/node/{relative_python}" "/opt/node/{relative_binary}" "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+
+    missing_bins = _agent_cli_missing_bins(agent_cli_dir, harnesses)
     if missing_bins:
         raise RuntimeError(
             "agent CLI setup did not create expected executable(s): "

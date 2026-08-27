@@ -85,7 +85,7 @@ save_interval=1
 
 # Long tool trajectories can overflow the exponential ratios in low_var_kl and
 # built-in TIS even with a long token cap. Use the bounded k2 form and a lower LR.
-train_lr=5e-7
+train_lr="${train_lr:-5e-7}"
 clip_grad=0.5
 kl_loss_coef=0.001
 kl_loss_type=k2
@@ -95,10 +95,15 @@ eps_clip_high=0.28
 eps_clip_c=10.0
 
 # PI/Polar settings.
-agent_harness=pi
-agent_label=multi_harness
-harness_pool=pi,codex,claude_code,qwen_code
-harness_seed=87
+agent_harness="${agent_harness:-pi}"
+agent_label="${agent_label:-multi_harness}"
+harness_pool="${harness_pool:-pi,codex,claude_code,qwen_code}"
+harness_seed="${harness_seed:-87}"
+harness_sampling_strategy="${harness_sampling_strategy:-uniform}"
+hapo_epsilon="${hapo_epsilon:-0.30}"
+hapo_learning_rate="${hapo_learning_rate:-0.10}"
+hapo_correct_threshold="${hapo_correct_threshold:-0.50}"
+agent_cli_dir="${agent_cli_dir:-}"
 anthropic_max_tokens=2048
 qwen_code_max_output_tokens=4096
 pi_api_type=openai-completions
@@ -133,10 +138,10 @@ rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 # Fixed identity shared by checkpoints and W&B. Inherited submit-shell
 # variables cannot redirect this task into another run or checkpoint tree.
 # Use a new script identity when intentionally starting a different experiment.
-run_label="2n16g-train8-rollout8-tp4dp2-4x2-60k-1gw-smoke2-fa4b19-pmerge-k2-multiharness"
-experiment_name="webarea-distill_mh_q35_2n_smoke2_tp4dp2_4x2_60k_1gw_20260805"
-run_id="${experiment_name}"
-run_generation="20260805-swegym-grpo-2n-smoke2-multiharness-v1"
+run_label="${run_label:-2n16g-train8-rollout8-tp4dp2-4x2-60k-1gw-smoke2-fa4b19-pmerge-k2-multiharness}"
+experiment_name="${experiment_name:-webarea-distill_mh_q35_2n_smoke2_tp4dp2_4x2_60k_1gw_20260805}"
+run_id="${run_id:-${experiment_name}}"
+run_generation="${run_generation:-20260805-swegym-grpo-2n-smoke2-multiharness-v1}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
@@ -151,6 +156,7 @@ wandb_entity=hwinf_dcm
 wandb_project=harnessgen
 wandb_group="${run_id}"
 wandb_run_id="${run_id}"
+wandb_single_owner="${wandb_single_owner:-0}"
 wandb_random_suffix=0
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 
@@ -199,11 +205,10 @@ case "${target_num_rollout}" in
     ''|*[!0-9]*) die "target_num_rollout must be a positive integer" ;;
 esac
 case "${exit_duration_minutes}" in
-    ''|*[!0-9]*) die "exit_duration_minutes must be a positive integer" ;;
+    ''|*[!0-9]*) die "exit_duration_minutes must be a non-negative integer" ;;
 esac
 [ "${target_num_rollout}" -eq 2 ] || \
     die "target_num_rollout must remain 2 for the isolated two-step smoke run"
-[ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
 
 # Strict isolated resume. This smoke run may resume only checkpoints produced
 # by this exact task, and a checkpoint is accepted only when all eight model
@@ -227,6 +232,11 @@ kl_loss_type=${kl_loss_type}
 use_tis=${use_tis}
 harness_pool=${harness_pool}
 harness_seed=${harness_seed}
+harness_sampling_strategy=${harness_sampling_strategy}
+hapo_epsilon=${hapo_epsilon}
+hapo_learning_rate=${hapo_learning_rate}
+hapo_correct_threshold=${hapo_correct_threshold}
+agent_cli_dir=${agent_cli_dir:-inner-default}
 pi_max_output_tokens=${pi_max_tokens}
 codex_max_output_tokens=cli-default
 claude_code_max_output_tokens=${anthropic_max_tokens}
@@ -383,7 +393,9 @@ export exit_duration_minutes train_idle_pulse_after_seconds train_idle_pulse_dur
 export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
-export agent_harness agent_label harness_pool harness_seed anthropic_max_tokens qwen_code_max_output_tokens pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
+export agent_harness agent_label harness_pool harness_seed harness_sampling_strategy
+export hapo_epsilon hapo_learning_rate hapo_correct_threshold agent_cli_dir
+export anthropic_max_tokens qwen_code_max_output_tokens pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
 export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
 export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
@@ -392,7 +404,7 @@ export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
 export rollout_port gateway_port
 export run_id run_label run_generation run_dir run_log_dir save_dir rollout_save_dir
-export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key
+export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key wandb_single_owner
 export dry_run ray_port ray_dashboard_port ray_num_cpus ray_expected_num_gpus ray_cluster_timeout_seconds
 export ray_memory_usage_threshold ray_memory_monitor_refresh_ms
 export ray_head_ip sglang_router_host stop_file
@@ -593,7 +605,8 @@ webarea multi-harness SWE-Gym GRPO
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
-  harnesses: ${harness_pool} (seed=${harness_seed}, one harness per prompt group)
+  harnesses: ${harness_pool} (seed=${harness_seed}, strategy=${harness_sampling_strategy}, one harness per prompt group)
+  HAPO:     epsilon=${hapo_epsilon}, lr=${hapo_learning_rate}, threshold=${hapo_correct_threshold}
   output cap:PI=${pi_max_tokens}, Codex=CLI default, Claude=${anthropic_max_tokens}, Qwen Code=${qwen_code_max_output_tokens}
   idle pulse:after=${train_idle_pulse_after_seconds}s, duration=${train_idle_pulse_duration_seconds}s, matrix=${train_idle_pulse_matrix_size}
   scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}

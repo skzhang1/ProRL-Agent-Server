@@ -43,10 +43,12 @@ megatron_dir="${megatron_dir:-${project_root}/tmp/swegym_deps/Megatron-LM}"
 gpus_per_node=8
 num_nodes=4
 total_gpus=32
-train_num_gpus=8
-actor_num_nodes=1
+train_num_gpus="${train_num_gpus:-8}"
+actor_num_nodes="${actor_num_nodes:-1}"
 actor_num_gpus_per_node=8
-rollout_num_gpus=24
+rollout_num_gpus="${rollout_num_gpus:-24}"
+allow_checkpoint_dp_reshard="${allow_checkpoint_dp_reshard:-0}"
+allow_uneven_dp_batch="${allow_uneven_dp_batch:-0}"
 rollout_num_gpus_per_engine=1
 tensor_model_parallel_size="${tensor_model_parallel_size:-4}"
 qwen_gdn_backend=fla
@@ -60,12 +62,12 @@ load_debug_rollout_data=""
 load_debug_rollout_data_subsample=""
 rollout_batch_size="${rollout_batch_size:-8}"
 n_samples_per_prompt="${n_samples_per_prompt:-8}"
-num_epoch=2
-# Two ceil epochs are 74 optimizer updates with 293 prompts and 8 prompts/step.
-# Slime saves checkpoint iteration 0 after rollout 0, so the exclusive rollout
-# boundary must be 74 to produce iter_0000073. Singleton allocations discover
-# the latest checkpoint and keep that global boundary. An explicit num_rollout keeps manual mode.
-target_num_rollout="${target_num_rollout:-74}"
+num_epoch="${num_epoch:-2}"
+# Derive the exclusive rollout boundary from the fixed 293-row dataset.
+# Checkpoint iteration 0 corresponds to rollout 0, so N updates end at N-1.
+train_prompt_count=293
+expected_target_num_rollout=$(( ((train_prompt_count + rollout_batch_size - 1) / rollout_batch_size) * num_epoch ))
+target_num_rollout="${target_num_rollout:-${expected_target_num_rollout}}"
 num_rollout="${num_rollout:-}"
 start_rollout_id="${start_rollout_id:-}"
 smoke_rows="${smoke_rows:-0}"
@@ -91,7 +93,7 @@ save_interval=1
 
 # Long tool trajectories can overflow the exponential ratios in low_var_kl and
 # built-in TIS even with a long token cap. Use the bounded k2 form and a lower LR.
-train_lr=5e-7
+train_lr="${train_lr:-5e-7}"
 clip_grad=0.5
 kl_loss_coef=0.001
 kl_loss_type=k2
@@ -101,10 +103,15 @@ eps_clip_high=0.28
 eps_clip_c=10.0
 
 # PI/Polar settings.
-agent_harness=pi
-agent_label=multi_harness
-harness_pool=pi,codex,claude_code,qwen_code
-harness_seed=87
+agent_harness="${agent_harness:-pi}"
+agent_label="${agent_label:-multi_harness}"
+harness_pool="${harness_pool:-pi,codex,claude_code,qwen_code}"
+harness_seed="${harness_seed:-87}"
+harness_sampling_strategy="${harness_sampling_strategy:-uniform}"
+hapo_epsilon="${hapo_epsilon:-0.30}"
+hapo_learning_rate="${hapo_learning_rate:-0.10}"
+hapo_correct_threshold="${hapo_correct_threshold:-0.50}"
+agent_cli_dir="${agent_cli_dir:-}"
 anthropic_max_tokens=2048
 qwen_code_max_output_tokens=4096
 pi_api_type=openai-completions
@@ -139,10 +146,10 @@ rollout_health_check_first_wait="${rollout_health_check_first_wait:-0}"
 # Keep the training/checkpoint identity stable for singleton resume. W&B uses
 # a separate stable ID so replacing a deleted dashboard run never redirects
 # this task into a different checkpoint tree.
-run_label="4n32g-train8-rollout24-tp4dp2-8x8-60k-3gw-2ep-fa4b19-pmerge-k2-multiharness"
-experiment_name="webarea-distill_mh_q35_4n_full293_2ep_tp4dp2_8x8_60k_3gw"
-run_id="${experiment_name}"
-run_generation="20260803-swegym-grpo-4n-multiharness-v1"
+run_label="${run_label:-4n32g-train8-rollout24-tp4dp2-8x8-60k-3gw-2ep-fa4b19-pmerge-k2-multiharness}"
+experiment_name="${experiment_name:-webarea-distill_mh_q35_4n_full293_2ep_tp4dp2_8x8_60k_3gw}"
+run_id="${run_id:-${experiment_name}}"
+run_generation="${run_generation:-20260803-swegym-grpo-4n-multiharness-v1}"
 run_dir="${project_root}/tmp/${run_id}"
 run_log_dir="${run_dir}/logs/job-${SLURM_JOB_ID}"
 save_dir="${project_root}/tmp/ckpt/${run_id}"
@@ -156,7 +163,8 @@ wandb_mode=online
 wandb_entity=hwinf_dcm
 wandb_project=harnessgen
 wandb_group="${run_id}"
-wandb_run_id="${run_id}_wandb_v2"
+wandb_run_id="${wandb_run_id:-${run_id}_wandb_v2}"
+wandb_single_owner="${wandb_single_owner:-0}"
 wandb_random_suffix=0
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 
@@ -197,6 +205,18 @@ esac
 [ -f "${slime_source_dir}/train_async.py" ] || die "missing friend Slime: ${slime_source_dir}"
 [ "$(git -C "${slime_source_dir}" rev-parse HEAD)" = "${slime_ref}" ] || die "friend Slime HEAD does not match pinned ref ${slime_ref}"
 [ -f "${slime_source_dir}/slime/backends/megatron_utils/train_idle_pulse.py" ] || die "friend Slime lacks train idle pulse support"
+[ "${train_num_gpus}" -eq "$((actor_num_nodes * actor_num_gpus_per_node))" ] || \
+    die "train_num_gpus must equal actor_num_nodes * actor_num_gpus_per_node"
+[ "$((train_num_gpus + rollout_num_gpus))" -eq "${total_gpus}" ] || \
+    die "train_num_gpus + rollout_num_gpus must equal total_gpus"
+case "${allow_checkpoint_dp_reshard}" in
+    0|1) ;;
+    *) die "allow_checkpoint_dp_reshard must be 0 or 1" ;;
+esac
+case "${allow_uneven_dp_batch}" in
+    0|1) ;;
+    *) die "allow_uneven_dp_batch must be 0 or 1" ;;
+esac
 [ "$((rollout_batch_size * n_samples_per_prompt))" = "${global_batch_size}" ] || die "global batch must equal rollout_batch_size * n_samples_per_prompt"
 # The inner launcher creates the converted checkpoint and PI CLI when they are
 # absent. This keeps a fresh durable worktree self-contained after cleanup.
@@ -204,15 +224,14 @@ case "${target_num_rollout}" in
     ''|*[!0-9]*) die "target_num_rollout must be a positive integer" ;;
 esac
 case "${exit_duration_minutes}" in
-    ''|*[!0-9]*) die "exit_duration_minutes must be a positive integer" ;;
+    ''|*[!0-9]*) die "exit_duration_minutes must be a non-negative integer" ;;
 esac
-[ "${target_num_rollout}" -eq 74 ] || \
-    die "target_num_rollout must remain 74 to produce checkpoint iteration 73 for two 293-row epochs at 8 prompts/step"
-[ "${exit_duration_minutes}" -ge 1 ] || die "exit_duration_minutes must be a positive integer"
+[ "${target_num_rollout}" -eq "${expected_target_num_rollout}" ] || \
+    die "target_num_rollout must be ${expected_target_num_rollout} for ${num_epoch} epochs of ${train_prompt_count} prompts at ${rollout_batch_size} prompts/step"
 
 # Strict singleton resume. This run may resume only checkpoints produced by
 # this exact multi-harness task, and a checkpoint is accepted only when all
-# eight model shards and the matching rollout cursor are present.
+# expected model shards and the matching rollout cursor are present.
 run_manifest="${save_dir}/run_generation.txt"
 expected_manifest="run_generation=${run_generation}
 project_root=${project_root}
@@ -232,6 +251,12 @@ kl_loss_type=${kl_loss_type}
 use_tis=${use_tis}
 harness_pool=${harness_pool}
 harness_seed=${harness_seed}
+harness_sampling_strategy=${harness_sampling_strategy}
+hapo_epsilon=${hapo_epsilon}
+hapo_learning_rate=${hapo_learning_rate}
+hapo_correct_threshold=${hapo_correct_threshold}
+wandb_single_owner=${wandb_single_owner}
+agent_cli_dir=${agent_cli_dir:-inner-default}
 pi_max_output_tokens=${pi_max_tokens}
 codex_max_output_tokens=cli-default
 claude_code_max_output_tokens=${anthropic_max_tokens}
@@ -272,8 +297,14 @@ if [ -s "${latest_file}" ]; then
     shopt -s nullglob
     checkpoint_shards=("${checkpoint_dir}"/__*_0.distcp)
     shopt -u nullglob
-    [ "${#checkpoint_shards[@]}" -eq "${train_num_gpus}" ] || \
-        die "checkpoint ${latest_iteration} has ${#checkpoint_shards[@]} shards; expected ${train_num_gpus}"
+    if [ "${#checkpoint_shards[@]}" -ne "${train_num_gpus}" ]; then
+        [ "${allow_checkpoint_dp_reshard}" = "1" ] || \
+            die "checkpoint ${latest_iteration} has ${#checkpoint_shards[@]} shards; expected ${train_num_gpus}"
+        [ "$(( ${#checkpoint_shards[@]} % tensor_model_parallel_size ))" -eq 0 ] || \
+            die "checkpoint shard count is incompatible with tensor parallel size ${tensor_model_parallel_size}"
+        printf "Checkpoint %s has %s shards; allowing DP reshard to %s train ranks\n" \
+            "${latest_iteration}" "${#checkpoint_shards[@]}" "${train_num_gpus}"
+    fi
     for shard in "${checkpoint_shards[@]}"; do
         [ -s "${shard}" ] || die "empty checkpoint shard: ${shard}"
     done
@@ -345,7 +376,7 @@ for raw in sys.argv[2:]:
     records.append((ipaddress.ip_address(ip), int(rank), node, ip))
 records.sort(key=lambda item: (item[0], item[1]))
 train = records[0]
-gateways = records[1:1 + count]
+gateways = records[-count:]
 if len(gateways) != count:
     raise SystemExit(f"failed to select {count} non-train gateway host(s)")
 print(f"TRAIN_NODE={train[2]}")
@@ -382,13 +413,16 @@ export POLAR_APPTAINER_DIRECT_EXEC
 export gpus_per_node num_nodes total_gpus train_num_gpus actor_num_nodes actor_num_gpus_per_node
 export rollout_num_gpus rollout_num_gpus_per_engine tensor_model_parallel_size qwen_gdn_backend
 export attention_backend qkv_format use_dynamic_batch_size use_sequence_parallel micro_batch_size global_batch_size
+export allow_uneven_dp_batch
 export load_debug_rollout_data load_debug_rollout_data_subsample
 export rollout_batch_size n_samples_per_prompt num_epoch target_num_rollout num_rollout start_rollout_id smoke_rows
 export exit_duration_minutes train_idle_pulse_after_seconds train_idle_pulse_duration_seconds train_idle_pulse_matrix_size
 export max_tokens_per_gpu log_probs_chunk_size rollout_max_response_len rollout_max_prompt_len
 export sglang_context_length sglang_mem_fraction_static distributed_timeout_minutes save_interval
 export train_lr clip_grad kl_loss_coef kl_loss_type use_tis eps_clip eps_clip_high eps_clip_c
-export agent_harness agent_label harness_pool harness_seed anthropic_max_tokens qwen_code_max_output_tokens pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
+export agent_harness agent_label harness_pool harness_seed harness_sampling_strategy
+export hapo_epsilon hapo_learning_rate hapo_correct_threshold agent_cli_dir
+export anthropic_max_tokens qwen_code_max_output_tokens pi_api_type pi_context_window pi_max_tokens pi_fail_on_context_limit
 export polar_builder_strategy polar_max_async_level polar_min_complete_accept_fraction
 export polar_multi_gateway polar_gateway_count polar_gateway_hosts polar_gateway_ranks slime_train_rank
 export polar_gateway_max_init_workers polar_gateway_max_run_workers polar_gateway_max_postrun_workers
@@ -397,7 +431,7 @@ export polar_runtime_memory_mb polar_task_timeout_seconds polar_request_timeout
 export use_fault_tolerance rollout_health_check_interval rollout_health_check_timeout rollout_health_check_first_wait
 export rollout_port gateway_port
 export run_id run_label run_generation run_dir run_log_dir save_dir rollout_save_dir
-export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key
+export use_wandb wandb_mode wandb_entity wandb_project wandb_group wandb_run_id wandb_random_suffix wandb_api_key wandb_single_owner
 export dry_run ray_port ray_dashboard_port ray_num_cpus ray_expected_num_gpus ray_cluster_timeout_seconds
 export ray_memory_usage_threshold ray_memory_monitor_refresh_ms
 export ray_head_ip sglang_router_host stop_file
@@ -592,16 +626,17 @@ webarea multi-harness SWE-Gym GRPO
   ray head:  ${ray_head_ip}
   train node:${slime_train_node:-slime-placement-default}${slime_train_rank:+ (rank ${slime_train_rank}, ip ${slime_train_ip})}
   account:   ${job_account}
-  GPUs:      8 train + 24 rollout
+  GPUs:      ${train_num_gpus} train + ${rollout_num_gpus} rollout
   gateways:  ${polar_gateway_count} (${polar_gateway_hosts}), ranks=${polar_gateway_ranks}, per-gateway workers init/run/post=${polar_gateway_max_init_workers}/${polar_gateway_max_run_workers}/${polar_gateway_max_postrun_workers}, restarts=${polar_gateway_max_restarts}
   CPUs:      ${ray_num_cpus} per node
   Ray mem:   threshold=${ray_memory_usage_threshold}${ray_memory_monitor_refresh_ms:+, refresh_ms=${ray_memory_monitor_refresh_ms}}
   TP/DP:     ${tensor_model_parallel_size}/$((train_num_gpus / tensor_model_parallel_size))
   batch:     ${rollout_batch_size} prompts x ${n_samples_per_prompt} samples = ${global_batch_size} trajectories
-  harnesses: ${harness_pool} (seed=${harness_seed}, one harness per prompt group)
+  harnesses: ${harness_pool} (seed=${harness_seed}, strategy=${harness_sampling_strategy}, one harness per prompt group)
+  HAPO:     epsilon=${hapo_epsilon}, lr=${hapo_learning_rate}, threshold=${hapo_correct_threshold}
   output cap:PI=${pi_max_tokens}, Codex=CLI default, Claude=${anthropic_max_tokens}, Qwen Code=${qwen_code_max_output_tokens}
   idle pulse:after=${train_idle_pulse_after_seconds}s, duration=${train_idle_pulse_duration_seconds}s, matrix=${train_idle_pulse_matrix_size}
-  scheduling:${resume_mode}, graceful budget=${exit_duration_minutes} min, singleton job name=${SLURM_JOB_NAME}
+  scheduling:${resume_mode}, exit budget=${exit_duration_minutes:-0} min (0=Slurm wall time), singleton job name=${SLURM_JOB_NAME}
   boundary:  ${num_rollout}/${target_num_rollout} (start=${start_rollout_id:-checkpoint})
   stability: lr=${train_lr}, KL=${kl_loss_coef}, clip=${clip_grad}, rollout_ft=${use_fault_tolerance}
   W&B:       ${wandb_entity}/${wandb_project}/${wandb_run_id}
@@ -617,4 +652,3 @@ srun --mpi=none --overlap --kill-on-bad-exit=1 --nodes="${num_nodes}" --ntasks="
     --container-workdir="${project_root}" \
     --container-writable --no-container-mount-home \
     bash "${worker_script}"
-

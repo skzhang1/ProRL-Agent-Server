@@ -130,6 +130,10 @@ model_name="${model_name:-Qwen/Qwen3.5-4B}"
 agent_harness="${agent_harness:-pi}"
 harness_pool="${harness_pool:-}"
 harness_seed="${harness_seed:-0}"
+harness_sampling_strategy="${harness_sampling_strategy:-uniform}"
+hapo_epsilon="${hapo_epsilon:-0.30}"
+hapo_learning_rate="${hapo_learning_rate:-0.10}"
+hapo_correct_threshold="${hapo_correct_threshold:-0.50}"
 agent_label="${agent_label:-${agent_harness}}"
 pi_model_name="${pi_model_name:-openai/${model_name}}"
 codex_model_name="${codex_model_name:-${model_name}}"
@@ -138,6 +142,9 @@ codex_reasoning_effort="${codex_reasoning_effort:-}"
 codex_reasoning_summary="${codex_reasoning_summary:-}"
 claude_model_name="${claude_model_name:-${model_name}}"
 qwen_code_model_name="${qwen_code_model_name:-${model_name}}"
+mini_swe_model_name="${mini_swe_model_name:-${model_name}}"
+openclaw_model_name="${openclaw_model_name:-openai/${model_name}}"
+nanobot_model_name="${nanobot_model_name:-${model_name}}"
 qwen_code_max_output_tokens="${qwen_code_max_output_tokens:-}"
 claude_max_turns="${claude_max_turns:-}"
 claude_max_thinking_tokens="${claude_max_thinking_tokens:-}"
@@ -246,6 +253,7 @@ else
     max_tokens_per_gpu="${max_tokens_per_gpu:-30000}"
 fi
 global_batch_size="${global_batch_size:-$((rollout_batch_size * n_samples_per_prompt))}"
+allow_uneven_dp_batch="${allow_uneven_dp_batch:-0}"
 qwen_code_max_output_tokens="${qwen_code_max_output_tokens:-${rollout_max_response_len}}"
 num_epoch="${num_epoch:-1}"
 start_rollout_id="${start_rollout_id:-}"
@@ -287,6 +295,12 @@ log_probs_chunk_size="${log_probs_chunk_size:-256}"
 pi_api_type="${pi_api_type:-openai-completions}"
 pi_max_tokens="${pi_max_tokens:-512}"
 pi_thinking="${pi_thinking:-}"
+mini_swe_step_limit="${mini_swe_step_limit:-}"
+openclaw_thinking="${openclaw_thinking:-}"
+nanobot_context_window="${nanobot_context_window:-${pi_context_window}}"
+nanobot_max_tokens="${nanobot_max_tokens:-8192}"
+nanobot_max_tool_iterations="${nanobot_max_tool_iterations:-200}"
+nanobot_reasoning_effort="${nanobot_reasoning_effort:-}"
 pi_fail_on_context_limit="${pi_fail_on_context_limit:-1}"
 if [ "${pi_fail_on_context_limit}" = "1" ]; then
     pi_compaction_enabled="${pi_compaction_enabled:-false}"
@@ -321,6 +335,7 @@ wandb_run_id="${wandb_run_id:-${run_id}}"
 wandb_random_suffix="${wandb_random_suffix:-0}"
 wandb_api_key="${wandb_api_key:-${WANDB_API_KEY:-}}"
 wandb_dir="$(abs_path "${wandb_dir:-${project_root}/logs/wandb}")"
+wandb_single_owner="${wandb_single_owner:-0}"
 
 if [ "${patch_container_runtime_only:-0}" != "1" ]; then
     if [ "${train_num_gpus}" -le 0 ]; then
@@ -397,6 +412,7 @@ export WANDB_MODE="${wandb_mode}"
 export WANDB_PROJECT="${wandb_project}"
 export WANDB_ENTITY="${wandb_entity}"
 export WANDB_DIR="${wandb_dir}"
+export SLIME_WANDB_SINGLE_OWNER="${wandb_single_owner}"
 fla_override_dir="${fla_override_dir:-}"
 flashqla_override_dir="${flashqla_override_dir:-${project_root}/tmp/runtime_overrides/flashqla_code_0_1_1}"
 if [ "${attention_backend}" = "flash" ]; then
@@ -522,6 +538,124 @@ stable_id_lines = (
 )
 if not all(line in text for line in stable_id_lines):
     raise SystemExit(f"missing native W&B stable run-id support in {path}")
+
+
+# A feature-gated relay gives HAPO one ordinary online W&B writer instead of
+# several experimental shared-mode clients. The shared launcher keeps its
+# historical behavior unless SLIME_WANDB_SINGLE_OWNER=1 is explicitly set.
+shared_primary = """    else:
+        init_kwargs["settings"] = wandb.Settings(
+            mode="shared",
+            x_primary=True,
+        )
+"""
+single_primary = """    elif os.environ.get("SLIME_WANDB_SINGLE_OWNER") == "1":
+        init_kwargs["settings"] = wandb.Settings(mode="online")
+    else:
+        init_kwargs["settings"] = wandb.Settings(
+            mode="shared",
+            x_primary=True,
+        )
+"""
+if shared_primary in text:
+    text = text.replace(shared_primary, single_primary, 1)
+elif single_primary not in text:
+    raise SystemExit(f"cannot install single-owner W&B primary mode in {path}")
+path.write_text(text, encoding="utf-8")
+
+logging_path = path.with_name("logging_utils.py")
+logging_text = logging_path.read_text(encoding="utf-8")
+marker = "# SLIME_WANDB_SINGLE_OWNER_RELAY"
+if marker not in logging_text:
+    state_needle = "_LOGGER_CONFIGURED = False\n"
+    state_block = """_LOGGER_CONFIGURED = False
+
+# SLIME_WANDB_SINGLE_OWNER_RELAY
+_wandb_relay_handle = None
+_wandb_relay_owner = False
+
+
+def _single_owner_enabled():
+    from slime_bridge.wandb_relay import single_owner_enabled
+
+    return single_owner_enabled()
+"""
+    if logging_text.count(state_needle) != 1:
+        raise SystemExit(f"unexpected logger state declaration in {logging_path}")
+    logging_text = logging_text.replace(state_needle, state_block, 1)
+
+    init_needle = """def init_tracking(args, primary: bool = True, **kwargs):
+    if primary:
+        wandb_utils.init_wandb_primary(args, **kwargs)
+    else:
+        wandb_utils.init_wandb_secondary(args, **kwargs)
+"""
+    init_block = """def init_tracking(args, primary: bool = True, **kwargs):
+    global _wandb_relay_handle, _wandb_relay_owner
+    if _single_owner_enabled():
+        if not args.use_wandb:
+            args.wandb_run_id = None
+            return
+        if primary:
+            from slime_bridge.wandb_relay import start_relay
+
+            _wandb_relay_handle, info = start_relay(args)
+            _wandb_relay_owner = True
+            logging.getLogger(__name__).info("Single-owner W&B relay ready: %s", info)
+        return
+    if primary:
+        wandb_utils.init_wandb_primary(args, **kwargs)
+    else:
+        wandb_utils.init_wandb_secondary(args, **kwargs)
+"""
+    if logging_text.count(init_needle) != 1:
+        raise SystemExit(f"unexpected init_tracking implementation in {logging_path}")
+    logging_text = logging_text.replace(init_needle, init_block, 1)
+
+    finish_needle = """    if not args.use_wandb:
+        return
+    try:
+        if wandb.run is not None:
+            wandb.finish()
+"""
+    finish_block = """    global _wandb_relay_handle, _wandb_relay_owner
+    if not args.use_wandb:
+        return
+    try:
+        if _single_owner_enabled():
+            if _wandb_relay_owner and _wandb_relay_handle is not None:
+                from slime_bridge.wandb_relay import finish_relay
+
+                finish_relay(_wandb_relay_handle)
+                _wandb_relay_handle = None
+                _wandb_relay_owner = False
+            return
+        if wandb.run is not None:
+            wandb.finish()
+"""
+    if logging_text.count(finish_needle) != 1:
+        raise SystemExit(f"unexpected finish_tracking implementation in {logging_path}")
+    logging_text = logging_text.replace(finish_needle, finish_block, 1)
+
+    log_needle = """    if args.use_wandb:
+        wandb_utils.define_logged_metric_axes(metrics, step_metric=step_key)
+        wandb.log(metrics)
+"""
+    log_block = """    if args.use_wandb:
+        if _single_owner_enabled():
+            from slime_bridge.wandb_relay import log_via_relay
+
+            log_via_relay(args, metrics, step_key)
+        else:
+            wandb_utils.define_logged_metric_axes(metrics, step_metric=step_key)
+            wandb.log(metrics)
+"""
+    if logging_text.count(log_needle) != 1:
+        raise SystemExit(f"unexpected W&B log implementation in {logging_path}")
+    logging_text = logging_text.replace(log_needle, log_block, 1)
+    logging_path.write_text(logging_text, encoding="utf-8")
+elif logging_text.count(marker) != 1:
+    raise SystemExit(f"duplicate single-owner W&B relay markers in {logging_path}")
 PY
 }
 
@@ -723,20 +857,18 @@ PY
 }
 
 prepare_agent_cli() {
-    if [ "${force_agent_cli}" != "1" ] && [ -x "${agent_cli_dir}/bin/pi" ] && [ -x "${agent_cli_dir}/bin/node" ]; then
-        log "Agent CLI exists: ${agent_cli_dir}"
-        return
-    fi
-    log "Preparing PI/agent CLI in current project: ${agent_cli_dir}"
-    "${python_bin}" - "${script_dir}" "${agent_cli_dir}" "${force_agent_cli}" <<'PY'
+    local configured_harnesses="${harness_pool:-${agent_harness}}"
+    log "Checking agent CLI bundle for ${configured_harnesses}: ${agent_cli_dir}"
+    "${python_bin}" - "${script_dir}" "${agent_cli_dir}" "${force_agent_cli}" "${configured_harnesses}" <<'PY'
 from pathlib import Path
 import sys
 script_dir = Path(sys.argv[1])
 agent_cli_dir = Path(sys.argv[2])
 force = sys.argv[3] == "1"
+harnesses = tuple(name.strip() for name in sys.argv[4].split(",") if name.strip())
 sys.path.insert(0, str(script_dir))
 from prepare_apptainer_images import ensure_agent_cli_dir  # noqa: E402
-ensure_agent_cli_dir(agent_cli_dir, force=force)
+ensure_agent_cli_dir(agent_cli_dir, force=force, harnesses=harnesses)
 PY
 }
 
@@ -773,12 +905,25 @@ render_runtime_configs() {
     export AGENT_HARNESS="${agent_harness}"
     export HARNESS_POOL="${harness_pool}"
     export HARNESS_SEED="${harness_seed}"
+    export HARNESS_SAMPLING_STRATEGY="${harness_sampling_strategy}"
+    export HAPO_EPSILON="${hapo_epsilon}"
+    export HAPO_LEARNING_RATE="${hapo_learning_rate}"
+    export HAPO_CORRECT_THRESHOLD="${hapo_correct_threshold}"
     export CODEX_MODEL_NAME="${codex_model_name}"
     export CODEX_VERSION="${codex_version}"
     export CODEX_REASONING_EFFORT="${codex_reasoning_effort}"
     export CODEX_REASONING_SUMMARY="${codex_reasoning_summary}"
     export CLAUDE_MODEL_NAME="${claude_model_name}"
     export QWEN_CODE_MODEL_NAME="${qwen_code_model_name}"
+    export MINI_SWE_MODEL_NAME="${mini_swe_model_name}"
+    export MINI_SWE_STEP_LIMIT="${mini_swe_step_limit}"
+    export OPENCLAW_MODEL_NAME="${openclaw_model_name}"
+    export OPENCLAW_THINKING="${openclaw_thinking}"
+    export NANOBOT_MODEL_NAME="${nanobot_model_name}"
+    export NANOBOT_CONTEXT_WINDOW="${nanobot_context_window}"
+    export NANOBOT_MAX_TOKENS="${nanobot_max_tokens}"
+    export NANOBOT_MAX_TOOL_ITERATIONS="${nanobot_max_tool_iterations}"
+    export NANOBOT_REASONING_EFFORT="${nanobot_reasoning_effort}"
     export CLAUDE_MAX_TURNS="${claude_max_turns}"
     export CLAUDE_MAX_THINKING_TOKENS="${claude_max_thinking_tokens}"
     export POLAR_ANTHROPIC_MAX_TOKENS="${anthropic_max_tokens}"
@@ -883,6 +1028,10 @@ config["polar_apptainer_image_dir"] = os.environ["APPTAINER_IMAGE_DIR"]
 config["polar_request_timeout"] = int(os.environ["POLAR_REQUEST_TIMEOUT"])
 config["polar_max_async_level"] = int(os.environ["POLAR_MAX_ASYNC_LEVEL"])
 config["polar_min_complete_accept_fraction"] = float(os.environ["POLAR_MIN_COMPLETE_ACCEPT_FRACTION"])
+config["polar_harness_sampling_strategy"] = os.environ["HARNESS_SAMPLING_STRATEGY"]
+config["polar_hapo_epsilon"] = float(os.environ["HAPO_EPSILON"])
+config["polar_hapo_learning_rate"] = float(os.environ["HAPO_LEARNING_RATE"])
+config["polar_hapo_correct_threshold"] = float(os.environ["HAPO_CORRECT_THRESHOLD"])
 
 task = config.setdefault("polar_task_template", {})
 task["timeout_seconds"] = int(os.environ["POLAR_TASK_TIMEOUT_SECONDS"])
@@ -899,7 +1048,10 @@ else:
 def env_flag(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
-supported_harnesses = {"pi", "codex", "claude_code", "qwen_code"}
+supported_harnesses = {
+    "pi", "codex", "claude_code", "qwen_code",
+    "mini_swe_agent", "openclaw", "nanobot",
+}
 agent_harness = os.environ["AGENT_HARNESS"].strip()
 pool_names = [
     name.strip()
@@ -970,6 +1122,21 @@ def build_agent(harness):
         agent.setdefault("env", {})["QWEN_CODE_MAX_OUTPUT_TOKENS"] = os.environ[
             "QWEN_CODE_MAX_OUTPUT_TOKENS"
         ]
+    elif harness == "mini_swe_agent":
+        agent["model_name"] = os.environ["MINI_SWE_MODEL_NAME"]
+        if os.environ.get("MINI_SWE_STEP_LIMIT"):
+            settings["step_limit"] = int(os.environ["MINI_SWE_STEP_LIMIT"])
+    elif harness == "openclaw":
+        agent["model_name"] = os.environ["OPENCLAW_MODEL_NAME"]
+        if os.environ.get("OPENCLAW_THINKING"):
+            settings["thinking"] = os.environ["OPENCLAW_THINKING"]
+    elif harness == "nanobot":
+        agent["model_name"] = os.environ["NANOBOT_MODEL_NAME"]
+        settings["context_window"] = int(os.environ["NANOBOT_CONTEXT_WINDOW"])
+        settings["max_tokens"] = int(os.environ["NANOBOT_MAX_TOKENS"])
+        settings["max_tool_iterations"] = int(os.environ["NANOBOT_MAX_TOOL_ITERATIONS"])
+        if os.environ.get("NANOBOT_REASONING_EFFORT"):
+            settings["reasoning_effort"] = os.environ["NANOBOT_REASONING_EFFORT"]
     return agent
 
 task["agent"] = build_agent(agent_harness)
@@ -1015,6 +1182,9 @@ preflight() {
         codex) [ -x "${agent_cli_dir}/bin/codex" ] || die "Codex CLI missing: ${agent_cli_dir}/bin/codex" ;;
         claude_code) [ -x "${agent_cli_dir}/bin/claude" ] || die "Claude Code CLI missing: ${agent_cli_dir}/bin/claude" ;;
         qwen_code) [ -x "${agent_cli_dir}/bin/qwen" ] || die "Qwen Code CLI missing: ${agent_cli_dir}/bin/qwen" ;;
+        mini_swe_agent) [ -x "${agent_cli_dir}/bin/mini-swe-agent" ] || die "mini-swe-agent CLI missing: ${agent_cli_dir}/bin/mini-swe-agent" ;;
+        openclaw) [ -x "${agent_cli_dir}/bin/openclaw" ] || die "OpenClaw CLI missing: ${agent_cli_dir}/bin/openclaw" ;;
+        nanobot) [ -x "${agent_cli_dir}/bin/nanobot" ] || die "NanoBot CLI missing: ${agent_cli_dir}/bin/nanobot" ;;
         *) die "Unsupported agent harness: ${harness}" ;;
     esac
     done
@@ -1287,6 +1457,7 @@ keys = [
     "SLIME_TRAIN_IDLE_PULSE_AFTER_SECONDS", "SLIME_TRAIN_IDLE_PULSE_DURATION_SECONDS",
     "SLIME_TRAIN_IDLE_PULSE_MATRIX_SIZE",
     "WANDB_API_KEY", "WANDB_MODE", "WANDB_PROJECT", "WANDB_ENTITY", "WANDB_DIR",
+    "SLIME_WANDB_SINGLE_OWNER",
     "HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE", "TRANSFORMERS_CACHE",
     "HF_DATASETS_CACHE", "HF_MODULES_CACHE", "SENTENCE_TRANSFORMERS_HOME",
     "APPTAINER_CACHEDIR", "APPTAINER_TMPDIR", "APPTAINER_WORKDIR",
@@ -1389,6 +1560,23 @@ PY
         )
     fi
 
+    local uneven_dp_batch_args=()
+    if [ "${allow_uneven_dp_batch}" = "1" ]; then
+        [ "${tensor_model_parallel_size}" -gt 0 ] || die "tensor_model_parallel_size must be positive"
+        [ "$((train_num_gpus % tensor_model_parallel_size))" -eq 0 ] || \
+            die "train_num_gpus must be divisible by tensor_model_parallel_size"
+        local train_dp_size=$((train_num_gpus / tensor_model_parallel_size))
+        local legacy_global_batch_size=$((global_batch_size / train_dp_size * train_dp_size))
+        [ "${legacy_global_batch_size}" -gt 0 ] || die "global_batch_size is smaller than train DP size"
+        uneven_dp_batch_args=(
+            --eval-global-batch-size "${legacy_global_batch_size}"
+            --decrease-batch-size-if-needed
+        )
+        log "Uneven DP batch: true global batch=${global_batch_size}, DP=${train_dp_size}, legacy/eval batch=${legacy_global_batch_size}"
+    elif [ "${allow_uneven_dp_batch}" != "0" ]; then
+        die "allow_uneven_dp_batch must be 0 or 1"
+    fi
+
     local sequence_parallel_args=()
     if [ "${use_sequence_parallel}" = "1" ]; then
         sequence_parallel_args=(--sequence-parallel)
@@ -1455,6 +1643,7 @@ PY
         --recompute-method uniform
         --recompute-num-layers 1
         "${batching_args[@]}"
+        "${uneven_dp_batch_args[@]}"
         --log-probs-chunk-size "${log_probs_chunk_size}"
         --advantage-estimator grpo
         --normalize-advantages
@@ -1472,7 +1661,7 @@ PY
         # Keep the scheduler horizon independent of the per-allocation
         # --num-rollout boundary.  Checkpoints otherwise encode 1*64, 4*64,
         # ... as incompatible horizons when a run is resumed in chunks.
-        --lr-decay-iters "${target_num_rollout:-74}"
+        --lr-decay-iters "${target_num_rollout:-${num_rollout}}"
         # The initial step-0 checkpoint predates the fixed horizon.  Override
         # its scheduler metadata while preserving its loaded num_steps,
         # optimizer tensors, model weights, and constant LR/weight decay.
@@ -1550,7 +1739,10 @@ log "Runtime SIF dir: ${apptainer_image_dir}"
 log "Agent CLI dir: ${agent_cli_dir}"
 log "Agent harness: ${agent_harness}"
 if [ -n "${harness_pool}" ]; then
-    log "Harness pool: ${harness_pool} (seed=${harness_seed})"
+    log "Harness pool: ${harness_pool} (seed=${harness_seed}, strategy=${harness_sampling_strategy})"
+    if [ "${harness_sampling_strategy}" = "hapo" ]; then
+        log "HAPO: epsilon=${hapo_epsilon}, lr=${hapo_learning_rate}, correct_threshold=${hapo_correct_threshold}"
+    fi
 fi
 if [ -n "${anthropic_max_tokens}" ]; then
     log "Anthropic max tokens cap: ${anthropic_max_tokens}"
